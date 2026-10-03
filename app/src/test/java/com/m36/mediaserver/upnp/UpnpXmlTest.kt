@@ -185,9 +185,10 @@ class UpnpXmlTest {
         isNamespaceAware = true
     }.newDocumentBuilder().parse(InputSource(StringReader(xml)))
 
-    private fun childText(parent: Element, name: String): String =
-        parent.getElementsByTagNameNS(if (name == "X_DLNADOC") DLNA_DEVICE_NS else DEVICE_NS, name)
-            .item(0).textContent.trim()
+    private fun childText(parent: Element, name: String): String {
+        val namespace = if (name == "X_DLNADOC") DLNA_DEVICE_NS else parent.namespaceURI ?: DEVICE_NS
+        return parent.getElementsByTagNameNS(namespace, name).item(0).textContent.trim()
+    }
 
     companion object {
         private const val DEVICE_NS = "urn:schemas-upnp-org:device-1-0"
