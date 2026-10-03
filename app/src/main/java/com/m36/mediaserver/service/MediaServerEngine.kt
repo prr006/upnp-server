@@ -191,8 +191,9 @@ class MediaServerEngine(
             ssdpServer?.updateInterfaces(detected)
         }
         val listening = httpServer?.listeningAddresses.orEmpty()
+        val hasEligibleLocalAddress = detected.addresses.any { it.priority >= MIN_LOCAL_INTERFACE_PRIORITY }
         metrics.serverStatus = when {
-            detected.addresses.isEmpty() -> "HTTP waiting for a reachable local IPv4 interface"
+            !hasEligibleLocalAddress -> "HTTP waiting for a reachable local IPv4 interface"
             listening.isEmpty() -> "Network found, but HTTP could not bind an eligible local address"
             else -> "Running — ${detected.networkLabel}; HTTP :${LocalHttpServer.PORT}"
         }
@@ -235,6 +236,7 @@ class MediaServerEngine(
     }
 
     companion object {
+        private const val MIN_LOCAL_INTERFACE_PRIORITY = 100
         private const val NETWORK_POLL_INTERVAL_MILLIS = 3_000L
     }
 }

@@ -45,9 +45,9 @@ The Gradle build uses AGP 8.7.3, Kotlin 2.0.21 and `kotlinx-coroutines-android` 
 1. On the phone, open **M36 Media Server** and grant notification permission when prompted. No broad storage permission is requested.
 2. Tap **Select Folder** and select `Internal storage/Jellyfin` (or the directory you actually want VLC to see). Confirm the picker selection. Android's SAF read grant is persisted across restarts.
 3. Tap **Start Server**. Keep its ongoing notification present; use the notification's **Stop Server** action or the app's **Stop Server** button to shut it down.
-4. Enable the M36 Mobile Hotspot and set the hotspot band to **5 GHz**. The server polls Android's network APIs/interfaces and should rebind/re-advertise when the hotspot interface appears; it is also fine to enable the hotspot before starting the server. Mobile data is not required.
-5. Connect the Fire TV Stick to the M36 hotspot. In VLC, open **Local Network → UPnP**, wait a few seconds, then open **M36 Media Server → Jellyfin → Sakamoto Days → Season 1** and select an MKV. VLC should make normal HTTP byte-range requests when seeking.
-6. To test the other cases, repeat with hotspot **2.4 GHz**, then with both devices on a regular Wi-Fi network at **5 GHz** and **2.4 GHz**. No address or URL is entered in VLC.
+4. Turn **Mobile data OFF**, enable the M36 Mobile Hotspot, and set the hotspot band to **5 GHz**. The server polls Android's network APIs/interfaces and should rebind/re-advertise when the hotspot interface appears; it is also fine to enable the hotspot before starting the server.
+5. Connect the Fire TV Stick to the M36 hotspot. In VLC, open **Local Network → UPnP**, wait a few seconds, then open **M36 Media Server → Jellyfin → Sakamoto Days → Season 1** and play an existing HEVC Main10 1080p MKV such as `E01.mkv`. Seek forward/back to check HTTP byte-range playback; the app does not transcode.
+6. To test the other cases, repeat with hotspot **2.4 GHz**, then connect both devices to a regular Wi-Fi network and repeat at **5 GHz** and **2.4 GHz**. No address or URL is entered in VLC.
 
 The app's **Show Details** panel is intended for diagnosing the first tethering test. Useful interpretations:
 

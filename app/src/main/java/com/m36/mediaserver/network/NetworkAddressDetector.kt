@@ -58,10 +58,12 @@ class NetworkAddressDetector(context: Context) {
         val wifiInterfaces = HashSet<String>()
         val defaultInterfaces = HashSet<String>()
         val cellularInterfaces = HashSet<String>()
+        val vpnInterfaces = HashSet<String>()
         val interfaceNetworks = HashMap<String, Network>()
         var hasWifi = false
         var hasCellular = false
         var hasEthernet = false
+        var hasVpn = false
         var defaultIsWifi = false
         var defaultIsCellular = false
 
@@ -80,6 +82,10 @@ class NetworkAddressDetector(context: Context) {
                 if (!iface.isNullOrBlank()) cellularInterfaces += iface
             }
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) hasEthernet = true
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                hasVpn = true
+                if (!iface.isNullOrBlank()) vpnInterfaces += iface
+            }
             if (network == defaultNetwork) {
                 if (!iface.isNullOrBlank()) defaultInterfaces += iface
                 defaultIsWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
@@ -101,7 +107,9 @@ class NetworkAddressDetector(context: Context) {
             val lower = ifaceName.lowercase(Locale.ROOT)
             val isWifiLike = ifaceName in wifiInterfaces || WIFI_INTERFACE_HINT.containsMatchIn(lower)
             val isCellularLike = ifaceName in cellularInterfaces || CELLULAR_INTERFACE_HINT.containsMatchIn(lower)
+            val isVpnLike = ifaceName in vpnInterfaces || VPN_INTERFACE_HINT.containsMatchIn(lower)
             val priority = when {
+                isVpnLike -> -100
                 ifaceName in wifiInterfaces -> 400
                 ifaceName in defaultInterfaces && defaultIsWifi -> 390
                 isWifiLike -> 350
@@ -147,6 +155,7 @@ class NetworkAddressDetector(context: Context) {
 
         val defaultCaps = defaultNetwork?.let { capabilities[it] }
         val hasWifiLikeInterface = sorted.any { WIFI_INTERFACE_HINT.containsMatchIn(it.interfaceName.lowercase(Locale.ROOT)) }
+        val hasEligibleLocalInterface = sorted.any { it.priority >= MIN_LOCAL_INTERFACE_PRIORITY }
         val label = when {
             defaultCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "Wi-Fi"
             defaultCaps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> "Ethernet"
@@ -154,19 +163,20 @@ class NetworkAddressDetector(context: Context) {
             hasWifiLikeInterface && !defaultIsWifi -> "Wi-Fi hotspot / local AP"
             hasWifi -> "Wi-Fi network"
             hasEthernet -> "Ethernet"
-            sorted.isNotEmpty() -> "Local network interface"
+            hasEligibleLocalInterface -> "Local network interface"
+            hasVpn -> "VPN active; no local Wi-Fi interface detected"
             defaultIsCellular || hasCellular -> "Cellular (no reachable local IPv4 found)"
+            sorted.isNotEmpty() -> "No eligible local interface detected"
             else -> "No active local network"
         }
 
-        // Keep the variable referenced for diagnostics-oriented classification even if Android
-        // reports cellular and a hotspot interface is currently absent.
-        @Suppress("UNUSED_VARIABLE") val cellularOnly = defaultIsCellular && !hasWifiLikeInterface
         return NetworkSnapshot(label, sorted, defaultInterfaces.firstOrNull())
     }
 
     companion object {
+        private const val MIN_LOCAL_INTERFACE_PRIORITY = 100
         private val WIFI_INTERFACE_HINT = Regex("(^|[^a-z])(wlan|wifi|ap|swlan)([0-9_]*|[^a-z].*)?", RegexOption.IGNORE_CASE)
         private val CELLULAR_INTERFACE_HINT = Regex("(rmnet|ccmni|pdp[_-]?ip|wwan|cellular|rmnet_data)", RegexOption.IGNORE_CASE)
+        private val VPN_INTERFACE_HINT = Regex("(^|[^a-z])(tun|tap|wg|utun|ppp)[0-9_]*", RegexOption.IGNORE_CASE)
     }
 }

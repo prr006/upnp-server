@@ -52,6 +52,7 @@ class SsdpServer(
 
             val created = ArrayList<InterfaceSocket>()
             val details = ArrayList<String>()
+            var anySocketCreated = false
             candidates.forEach { candidate ->
                 val networkInterface = candidate.networkInterface
                     ?: runCatching { NetworkInterface.getByName(candidate.interfaceName) }.getOrNull()
@@ -60,6 +61,7 @@ class SsdpServer(
                     return@forEach
                 }
                 val attempt = openInterface(candidate, networkInterface)
+                anySocketCreated = anySocketCreated || attempt.socketCreated
                 if (attempt.socket != null) {
                     created += attempt.socket
                     details += "${candidate.interfaceName} (${candidate.hostAddress}): group joined"
@@ -69,12 +71,12 @@ class SsdpServer(
             }
 
             activeSockets.addAll(created)
-            metrics.multicastSocketCreated = created.isNotEmpty()
+            metrics.multicastSocketCreated = anySocketCreated
             metrics.multicastGroupJoined = created.any { it.joined }
             metrics.multicastDetails = details.ifEmpty { listOf("No eligible active IPv4 interface") }.joinToString("; ")
             metrics.ssdpStatus = when {
                 created.any { it.joined } -> "Listening on ${created.filter { it.joined }.joinToString { it.interfaceName }}"
-                created.isNotEmpty() -> "Socket created, but multicast group join failed"
+                anySocketCreated -> "Socket created, but multicast group join failed"
                 else -> "No multicast-capable local IPv4 interface"
             }
             created.forEach { sendAlive(it) }
@@ -105,6 +107,7 @@ class SsdpServer(
 
     private fun openInterface(candidate: ReachableAddress, networkInterface: NetworkInterface): InterfaceOpenResult {
         var lastError: Throwable? = null
+        var socketCreated = false
         val possibleNetworks: List<Network?> = if (candidate.network == null) {
             listOf(null)
         } else {
@@ -114,6 +117,7 @@ class SsdpServer(
             var socket: MulticastSocket? = null
             try {
                 socket = MulticastSocket(null)
+                socketCreated = true
                 socket.reuseAddress = true
                 if (network != null) {
                     // Bind the socket to Android's actual Network when it maps to this interface.
@@ -133,13 +137,13 @@ class SsdpServer(
                     socket = socket,
                 )
                 startReceiver(context)
-                return InterfaceOpenResult(context, null)
+                return InterfaceOpenResult(context, null, socketCreated)
             } catch (error: Throwable) {
                 lastError = error
                 runCatching { socket?.close() }
             }
         }
-        return InterfaceOpenResult(null, lastError?.message ?: "Unable to create multicast socket")
+        return InterfaceOpenResult(null, lastError?.message ?: "Unable to create multicast socket", socketCreated)
     }
 
     private fun startReceiver(context: InterfaceSocket) {
@@ -317,7 +321,7 @@ class SsdpServer(
     }
 
     private data class Advertisement(val searchTarget: String, val usn: String)
-    private data class InterfaceOpenResult(val socket: InterfaceSocket?, val error: String?)
+    private data class InterfaceOpenResult(val socket: InterfaceSocket?, val error: String?, val socketCreated: Boolean)
 
     private class InterfaceSocket(
         val interfaceName: String,
