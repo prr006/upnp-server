@@ -1,0 +1,13 @@
+# Gradle / Android Studio
+.gradle/
+**/build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Debug/release outputs are generated locally; copy the requested APK beside README when needed.
+app-debug.apk
+*.aab
