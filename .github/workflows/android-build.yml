@@ -60,7 +60,10 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          summary="$(tail -n 80 build-output.log)"
+          matches="$(grep -iE '(^e: |error|failed|failure|expected|actual|assertion|exception|caused by|what went wrong|execution failed|> Task .*FAILED)' build-output.log | tail -n 24 || true)"
+          tail_lines="$(tail -n 12 build-output.log)"
+          summary="$(printf 'Failure-related lines:\n%s\n\nFinal log lines:\n%s\n' "$matches" "$tail_lines")"
+          summary="${summary:0:3500}"
           {
             echo "## Gradle build failure"
             echo
