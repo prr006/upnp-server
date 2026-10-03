@@ -20,10 +20,16 @@ $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-35" "build-
 ./gradlew :app:assembleDebug
 ```
 
-The debug APK is produced at:
+The local debug APK is produced at:
 
 ```text
 app/build/outputs/apk/debug/app-debug.apk
+```
+
+The branch CI build also publishes a directly installable copy at:
+
+```text
+artifacts/M36-Media-Server-debug.apk
 ```
 
 Install it with Android Studio, or:
