@@ -42,7 +42,19 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Run unit tests and assemble debug APK
-        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug 2>&1 | tee build-output.log
+
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: M36-debug-build-diagnostics
+          path: build-output.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
