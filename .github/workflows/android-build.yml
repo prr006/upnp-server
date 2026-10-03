@@ -56,6 +56,23 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Expose Gradle failure summary
+        if: failure()
+        shell: bash
+        run: |
+          summary="$(tail -n 80 build-output.log)"
+          {
+            echo "## Gradle build failure"
+            echo
+            echo '```text'
+            printf '%s\n' "$summary"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          escaped="${summary//'%'/'%25'}"
+          escaped="${escaped//$'\r'/'%0D'}"
+          escaped="${escaped//$'\n'/'%0A'}"
+          echo "::error title=Gradle build failure::$escaped"
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
