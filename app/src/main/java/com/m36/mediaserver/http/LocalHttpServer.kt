@@ -44,7 +44,11 @@ class LocalHttpServer(
     private val metrics: ServerMetrics,
     private val networkSnapshot: () -> NetworkSnapshot,
 ) : Closeable {
-    private val contentDirectory = ContentDirectoryService(repository)
+    private val contentDirectory = ContentDirectoryService(repository) { request, result, safTraversal ->
+        metrics.lastContentDirectoryBrowseRequest = request
+        metrics.lastContentDirectoryBrowseResult = result
+        metrics.lastSafEnumeration = safTraversal
+    }
     private val connectionManager = ConnectionManagerService()
     private val executor = ThreadPoolExecutor(
         4,

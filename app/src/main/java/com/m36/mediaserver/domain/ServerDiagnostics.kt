@@ -25,5 +25,8 @@ data class ServerDiagnostics(
     val ssdpResponsesSent: Long = 0,
     val httpRequestCount: Long = 0,
     val lastHttpRequest: String = "—",
+    val lastContentDirectoryBrowseRequest: String = "—",
+    val lastContentDirectoryBrowseResult: String = "—",
+    val lastSafEnumeration: String = "—",
     val selectedFolder: String = "Not selected",
 )

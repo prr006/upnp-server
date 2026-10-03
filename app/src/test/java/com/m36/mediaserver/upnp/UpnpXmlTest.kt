@@ -35,6 +35,26 @@ class UpnpXmlTest {
     }
 
     @Test
+    fun containersSerializeAnActualChildCount() {
+        val node = MediaNode(
+            objectId = "d:season1",
+            parentId = "d:show",
+            documentId = "season1",
+            title = "Season 1",
+            isContainer = true,
+            mimeType = "vnd.android.document/directory",
+            size = -1,
+            modifiedMillis = 0,
+            childCount = 22,
+        )
+
+        val output = UpnpXml.didlNode(node)
+        assertTrue(output.startsWith("<container id=\"d:season1\" parentID=\"d:show\""))
+        assertTrue(output.contains("childCount=\"22\""))
+        assertTrue(output.contains("<upnp:class>object.container.storageFolder</upnp:class>"))
+    }
+
+    @Test
     fun rootDescriptionAdvertisesBothServicesAndStableUdn() {
         val description = UpnpXml.rootDescription("11111111-2222-3333-4444-555555555555", "http://192.0.2.2:8200")
         assertTrue(description.contains("<friendlyName>M36 Media Server</friendlyName>"))

@@ -253,6 +253,9 @@ class MainActivity : Activity() {
             appendLine("SSDP responses sent: ${diagnostics.ssdpResponsesSent}")
             appendLine("HTTP request count: ${diagnostics.httpRequestCount}")
             appendLine("Last HTTP request: ${diagnostics.lastHttpRequest}")
+            appendLine("ContentDirectory Browse request: ${diagnostics.lastContentDirectoryBrowseRequest}")
+            appendLine("ContentDirectory result: ${diagnostics.lastContentDirectoryBrowseResult}")
+            appendLine("Last SAF traversal: ${diagnostics.lastSafEnumeration}")
             append("Selected shared folder: ${diagnostics.selectedFolder.takeIf { it != "Not selected" } ?: selectedFolderName}")
         }
     }

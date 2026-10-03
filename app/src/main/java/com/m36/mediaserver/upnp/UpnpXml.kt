@@ -132,7 +132,8 @@ object UpnpXml {
     fun didlNode(node: MediaNode, resourceUrl: String? = null): String {
         val title = xmlEscape(node.title)
         return if (node.isContainer) {
-            "<container id=\"${xmlEscape(node.objectId)}\" parentID=\"${xmlEscape(node.parentId)}\" restricted=\"1\">" +
+            val childCount = node.childCount?.let { " childCount=\"$it\"" }.orEmpty()
+            "<container id=\"${xmlEscape(node.objectId)}\" parentID=\"${xmlEscape(node.parentId)}\" restricted=\"1\"$childCount>" +
                 "<dc:title>$title</dc:title><upnp:class>object.container.storageFolder</upnp:class></container>"
         } else {
             val itemClass = mediaClass(node.mimeType)

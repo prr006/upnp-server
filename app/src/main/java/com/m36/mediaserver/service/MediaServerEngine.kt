@@ -119,6 +119,9 @@ class MediaServerEngine(
             ssdpResponsesSent = metrics.ssdpResponsesSent.get(),
             httpRequestCount = metrics.httpRequestCount.get(),
             lastHttpRequest = metrics.lastHttpRequest,
+            lastContentDirectoryBrowseRequest = metrics.lastContentDirectoryBrowseRequest,
+            lastContentDirectoryBrowseResult = metrics.lastContentDirectoryBrowseResult,
+            lastSafEnumeration = metrics.lastSafEnumeration,
             selectedFolder = metrics.selectedFolder,
         )
     }

@@ -9,6 +9,9 @@ class ServerMetrics {
 
     @Volatile var lastSsdpRequest: String = "—"
     @Volatile var lastHttpRequest: String = "—"
+    @Volatile var lastContentDirectoryBrowseRequest: String = "—"
+    @Volatile var lastContentDirectoryBrowseResult: String = "—"
+    @Volatile var lastSafEnumeration: String = "—"
     @Volatile var ssdpStatus: String = "Stopped"
     @Volatile var multicastDetails: String = "—"
     @Volatile var multicastSocketCreated: Boolean = false
