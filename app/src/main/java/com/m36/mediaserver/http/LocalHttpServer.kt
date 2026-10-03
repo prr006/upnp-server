@@ -213,9 +213,21 @@ class LocalHttpServer(
             request.method == "GET" && path == "/connectionmanager/scpd.xml" ->
                 writeText(output, 200, "OK", UpnpXml.connectionManagerScpd(), "text/xml; charset=\"utf-8\"")
             request.method == "POST" && isContentDirectoryControl(path) ->
-                handleSoap(output, request, baseUrlFor(socket), isContentDirectory = true)
+                handleSoap(
+                    output,
+                    request,
+                    baseUrlFor(socket),
+                    socket.inetAddress.hostAddress,
+                    isContentDirectory = true,
+                )
             request.method == "POST" && isConnectionManagerControl(path) ->
-                handleSoap(output, request, baseUrlFor(socket), isContentDirectory = false)
+                handleSoap(
+                    output,
+                    request,
+                    baseUrlFor(socket),
+                    socket.inetAddress.hostAddress,
+                    isContentDirectory = false,
+                )
             request.method == "SUBSCRIBE" && isEventPath(path) -> handleSubscribe(output, request)
             request.method == "UNSUBSCRIBE" && isEventPath(path) -> writeEmpty(output, 200, "OK")
             request.method == "GET" && path.startsWith("/media/") ->
@@ -233,14 +245,36 @@ class LocalHttpServer(
         output: BufferedOutputStream,
         request: HttpRequest,
         baseUrl: String,
+        clientAddress: String,
         isContentDirectory: Boolean,
     ) {
+        val rawSoapAction = request.rawHeaders["soapaction"] ?: request.headers["soapaction"]
+        val contentType = request.rawHeaders["content-type"] ?: request.headers["content-type"]
+        val soapBody = request.body.toString(StandardCharsets.UTF_8)
+        var actionName: String? = null
+        var actionNamespace: String? = null
+        var recognition = "SOAP body not parsed"
+        var responseStatus = 500
+        var responseReason = "Internal Server Error"
+        var upnpErrorCode: Int? = null
+        var responseBody = ""
+        var responseHeaders = emptyList<String>()
+
         try {
-            val parsed = SoapXml.parseAction(request.body.toString(StandardCharsets.UTF_8))
-            val headerAction = request.headers["soapaction"]
-                ?.trim()?.trim('"')?.substringAfter('#', "")?.trim()
-            if (!headerAction.isNullOrBlank() && !headerAction.equals(parsed.actionName, ignoreCase = true)) {
-                throw UpnpFault(401, "SOAPAction does not match body")
+            // Content-Type is diagnostic only: a valid SOAP body is not gated on one exact media type.
+            val parsed = SoapXml.parseAction(soapBody)
+            actionName = parsed.actionName
+            actionNamespace = parsed.actionNamespace
+            val headerActionName = SoapXml.actionNameFromSoapAction(rawSoapAction)
+            if (isContentDirectory) {
+                val classification = recognizeContentDirectoryAction(parsed.actionName)
+                val headerNote = when {
+                    rawSoapAction.isNullOrBlank() -> "SOAPAction missing; dispatching from SOAP body"
+                    headerActionName == null -> "SOAPAction unparsed; dispatching from SOAP body"
+                    headerActionName.equals(parsed.actionName, ignoreCase = true) -> "SOAPAction matches SOAP body"
+                    else -> "SOAPAction/body mismatch (header action=$headerActionName); dispatching from SOAP body"
+                }
+                recognition = "$classification; $headerNote"
             }
             val serviceType = if (isContentDirectory) {
                 UpnpXml.CONTENT_DIRECTORY_TYPE
@@ -252,22 +286,67 @@ class LocalHttpServer(
             } else {
                 connectionManager.handle(parsed.actionName, parsed.arguments)
             }
-            val response = SoapXml.response(parsed.actionName, serviceType, outputs)
-            writeText(output, 200, "OK", response, "text/xml; charset=\"utf-8\"")
+            responseBody = SoapXml.response(parsed.actionName, serviceType, outputs)
+            responseStatus = 200
+            responseReason = "OK"
         } catch (fault: UpnpFault) {
-            val response = SoapXml.fault(fault)
+            upnpErrorCode = fault.errorCode
+            if (isContentDirectory) {
+                recognition = actionName?.let {
+                    "${recognizeContentDirectoryAction(it)} rejected: UPnP ${fault.errorCode} ${fault.message}"
+                } ?: "SOAP parse rejected: UPnP ${fault.errorCode} ${fault.message}"
+            }
+            responseBody = SoapXml.fault(fault)
+            responseHeaders = listOf("EXT:")
+        } catch (error: Exception) {
+            val fault = UpnpFault(501, "Action Failed")
+            upnpErrorCode = fault.errorCode
+            if (isContentDirectory) {
+                recognition = "${actionName?.let(::recognizeContentDirectoryAction) ?: "SOAP parse error"} rejected: ${error.message ?: error.javaClass.simpleName}"
+            }
+            responseBody = SoapXml.fault(fault)
+            responseHeaders = listOf("EXT:")
+        }
+
+        var responseWritten = false
+        try {
             writeText(
                 output,
-                500,
-                "Internal Server Error",
-                response,
+                responseStatus,
+                responseReason,
+                responseBody,
                 "text/xml; charset=\"utf-8\"",
-                listOf("EXT:"),
+                responseHeaders,
             )
-        } catch (error: Exception) {
-            val response = SoapXml.fault(UpnpFault(501, "Action Failed"))
-            writeText(output, 500, "Internal Server Error", response, "text/xml; charset=\"utf-8\"")
+            responseWritten = true
+        } finally {
+            if (isContentDirectory) {
+                val requestDescription = "POST ${request.path} from $clientAddress"
+                val status = buildString {
+                    append(responseStatus).append(' ').append(responseReason)
+                    upnpErrorCode?.let { append(" (UPnP fault ").append(it).append(')') }
+                    if (!responseWritten) append(" (response write failed)")
+                }
+                metrics.recordContentDirectorySoapTransaction(
+                    request = requestDescription,
+                    responseStatus = status,
+                    soapAction = rawSoapAction,
+                    contentType = contentType,
+                    body = soapBody,
+                    actionName = actionName,
+                    actionNamespace = actionNamespace,
+                    recognition = recognition,
+                )
+            }
         }
+    }
+
+    private fun recognizeContentDirectoryAction(actionName: String): String = when (actionName) {
+        "Browse" -> "Browse"
+        "GetSystemUpdateID" -> "GetSystemUpdateID"
+        "GetSearchCapabilities" -> "GetSearchCapabilities"
+        "GetSortCapabilities" -> "GetSortCapabilities"
+        else -> "Other: $actionName"
     }
 
     private fun handleSubscribe(output: BufferedOutputStream, request: HttpRequest) {
@@ -432,6 +511,7 @@ class LocalHttpServer(
         val rawTarget = requestParts[1]
         val path = normalizePath(rawTarget)
         val headers = LinkedHashMap<String, String>()
+        val rawHeaders = LinkedHashMap<String, String>()
         var consumedBytes = requestLine.length
         while (true) {
             val line = readAsciiLine(input, MAX_HEADER_BYTES) ?: throw IOException("Truncated HTTP headers")
@@ -441,8 +521,11 @@ class LocalHttpServer(
             val colon = line.indexOf(':')
             if (colon <= 0) continue
             val name = line.substring(0, colon).trim().lowercase(Locale.ROOT)
-            val value = line.substring(colon + 1).trim()
-            if (name !in headers) headers[name] = value
+            val rawValue = line.substring(colon + 1)
+            if (name !in headers) {
+                headers[name] = rawValue.trim()
+                rawHeaders[name] = rawValue
+            }
         }
         if (headers["transfer-encoding"]?.contains("chunked", true) == true) {
             throw IOException("Chunked request bodies are not supported")
@@ -451,7 +534,7 @@ class LocalHttpServer(
         if (contentLength > MAX_REQUEST_BODY_BYTES) throw RequestTooLargeException()
         val body = ByteArray(contentLength.toInt())
         if (body.isNotEmpty()) DataInputStream(input).readFully(body)
-        return HttpRequest(method, rawTarget, path, headers, body)
+        return HttpRequest(method, rawTarget, path, headers, rawHeaders, body)
     }
 
     private fun normalizePath(target: String): String {
@@ -526,6 +609,7 @@ class LocalHttpServer(
         val target: String,
         val path: String,
         val headers: Map<String, String>,
+        val rawHeaders: Map<String, String>,
         val body: ByteArray,
     )
 

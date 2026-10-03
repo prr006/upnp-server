@@ -259,6 +259,23 @@ class MainActivity : Activity() {
             appendLine("Last ContentDirectory SCPD GET: ${diagnostics.lastContentDirectoryScpdGet}")
             appendLine("ContentDirectory controlURL request count: ${diagnostics.contentDirectoryControlRequestCount}")
             appendLine("Last ContentDirectory controlURL request: ${diagnostics.lastContentDirectoryControlRequest}")
+            appendLine("Last ContentDirectory HTTP response status: ${diagnostics.lastContentDirectoryControlHttpStatus}")
+            appendLine("Last ContentDirectory SOAPAction: ${diagnostics.lastContentDirectorySoapAction}")
+            appendLine("Last ContentDirectory Content-Type: ${diagnostics.lastContentDirectorySoapContentType}")
+            appendLine("Last ContentDirectory SOAP action name: ${diagnostics.lastContentDirectorySoapActionName}")
+            appendLine("Last ContentDirectory SOAP action namespace: ${diagnostics.lastContentDirectorySoapActionNamespace}")
+            appendLine("Last ContentDirectory recognized action: ${diagnostics.lastContentDirectorySoapRecognition}")
+            appendLine("Last ContentDirectory SOAP body:")
+            appendLine(diagnostics.lastContentDirectorySoapBody)
+            appendLine("Recent ContentDirectory SOAP transactions (up to 8):")
+            if (diagnostics.contentDirectorySoapHistory.isEmpty()) {
+                appendLine("  (none)")
+            } else {
+                diagnostics.contentDirectorySoapHistory.forEachIndexed { index, transaction ->
+                    appendLine("--- ContentDirectory POST ${index + 1} ---")
+                    appendLine(transaction)
+                }
+            }
             appendLine("Advertised ContentDirectory serviceType: ${diagnostics.advertisedContentDirectoryServiceType}")
             appendLine("Advertised ContentDirectory serviceId: ${diagnostics.advertisedContentDirectoryServiceId}")
             appendLine("Advertised ContentDirectory SCPDURL: ${diagnostics.advertisedContentDirectoryScpdUrl}")

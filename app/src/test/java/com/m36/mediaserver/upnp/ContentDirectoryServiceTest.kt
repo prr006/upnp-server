@@ -7,6 +7,7 @@ import javax.xml.parsers.DocumentBuilderFactory
 import org.xml.sax.InputSource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -126,11 +127,23 @@ class ContentDirectoryServiceTest {
         assertTrue(outputs.getValue("Result").contains("id=\"i:e02\""))
         assertTrue(traces.last().first.contains("ObjectID=d:season1"))
         assertTrue(traces.last().first.contains("BrowseFlag=BrowseDirectChildren"))
+        assertTrue(traces.last().first.contains("Filter=*"))
+        assertTrue(traces.last().first.contains("SortCriteria=+dc:title"))
         assertTrue(traces.last().first.contains("RequestedCount=1"))
         assertTrue(traces.last().first.contains("StartingIndex=1"))
         assertTrue(traces.last().second.contains("NumberReturned=1"))
         assertTrue(traces.last().second.contains("TotalMatches=22"))
         assertTrue(traces.last().third.contains("SAF enumerated"))
+    }
+
+    @Test
+    fun unsupportedActionRaisesTheStandardInvalidActionFault() {
+        val service = ContentDirectoryService(TestCatalog())
+        val fault = assertThrows(UpnpFault::class.java) {
+            service.handle("NotAContentDirectoryAction", emptyMap(), "http://10.221.18.195:8200")
+        }
+        assertEquals(401, fault.errorCode)
+        assertTrue(SoapXml.fault(fault).contains("<errorCode>401</errorCode>"))
     }
 
     private fun browse(service: ContentDirectoryService, objectId: String, baseUrl: String): String =
@@ -140,6 +153,7 @@ class ContentDirectoryServiceTest {
     private fun browseArgs(objectId: String, flag: String) = mapOf(
         "ObjectID" to objectId,
         "BrowseFlag" to flag,
+        "Filter" to "*",
         "StartingIndex" to "0",
         "RequestedCount" to "0",
         "SortCriteria" to "+dc:title",

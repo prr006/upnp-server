@@ -10,15 +10,23 @@ import org.xml.sax.InputSource
 
 class UpnpFault(val errorCode: Int, override val message: String) : Exception(message)
 
-data class SoapActionRequest(val actionName: String, val arguments: Map<String, String>)
+data class SoapActionRequest(
+    val actionName: String,
+    val arguments: Map<String, String>,
+    val actionNamespace: String,
+    val envelopeNamespace: String,
+)
 
 object SoapXml {
     private const val SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
     private const val CONTENT_DIRECTORY_NS = "urn:schemas-upnp-org:service:ContentDirectory:1"
     private const val CONNECTION_MANAGER_NS = "urn:schemas-upnp-org:service:ConnectionManager:1"
 
+    /** Parse by XML namespace URI and local names, never by the sender's chosen prefixes. */
     fun parseAction(xml: String): SoapActionRequest {
         try {
+            val normalizedXml = xml.removePrefix("\uFEFF")
+            if (normalizedXml.isBlank()) throw UpnpFault(402, "Invalid Args: empty SOAP body")
             val factory = DocumentBuilderFactory.newInstance().apply {
                 isNamespaceAware = true
                 isXIncludeAware = false
@@ -28,28 +36,56 @@ object SoapXml {
                 setFeature("http://xml.org/sax/features/external-general-entities", false)
                 setFeature("http://xml.org/sax/features/external-parameter-entities", false)
             }
-            val document = factory.newDocumentBuilder().parse(InputSource(StringReader(xml)))
-            val body = document.getElementsByTagNameNS(SOAP_NS, "Body").item(0) as? Element
-                ?: throw UpnpFault(401, "SOAP Body missing")
-            val action = body.childNodes.let { children ->
-                (0 until children.length)
-                    .mapNotNull { children.item(it) as? Element }
-                    .firstOrNull()
-            } ?: throw UpnpFault(401, "SOAP action missing")
-            val actionName = action.localName ?: action.tagName.substringAfter(':')
-            val arguments = LinkedHashMap<String, String>()
-            val children = action.childNodes
-            for (index in 0 until children.length) {
-                val element = children.item(index) as? Element ?: continue
-                val name = element.localName ?: element.tagName.substringAfter(':')
-                arguments[name] = element.textContent ?: ""
+            val document = factory.newDocumentBuilder().parse(InputSource(StringReader(normalizedXml)))
+            val envelope = document.documentElement
+                ?: throw UpnpFault(402, "Invalid Args: SOAP Envelope missing")
+            if (localName(envelope) != "Envelope" || envelope.namespaceURI != SOAP_NS) {
+                throw UpnpFault(402, "Invalid Args: SOAP 1.1 Envelope namespace missing")
             }
-            return SoapActionRequest(actionName, arguments)
+            val body = childElements(envelope).firstOrNull {
+                localName(it) == "Body" && it.namespaceURI == envelope.namespaceURI
+            } ?: throw UpnpFault(402, "Invalid Args: SOAP Body missing")
+            val action = childElements(body).firstOrNull()
+                ?: throw UpnpFault(401, "SOAP action missing")
+            val actionName = localName(action).trim()
+            if (actionName.isEmpty()) throw UpnpFault(401, "SOAP action name missing")
+            val arguments = LinkedHashMap<String, String>()
+            for (element in childElements(action)) {
+                val name = localName(element).trim()
+                if (name.isNotEmpty()) arguments[name] = element.textContent.orEmpty().trim()
+            }
+            return SoapActionRequest(
+                actionName = actionName,
+                arguments = arguments,
+                actionNamespace = action.namespaceURI.orEmpty(),
+                envelopeNamespace = envelope.namespaceURI.orEmpty(),
+            )
         } catch (fault: UpnpFault) {
             throw fault
         } catch (error: Exception) {
             throw UpnpFault(402, "Invalid Args: ${error.message ?: "malformed SOAP XML"}")
         }
+    }
+
+    /** SOAPAction is a hint; parse quoted or unquoted values for diagnostics/consistency checks. */
+    fun actionNameFromSoapAction(rawValue: String?): String? {
+        var value = rawValue?.trim().orEmpty()
+        if (value.isEmpty() || value == "\"\"" || value == "''") return null
+        while (value.length >= 2 &&
+            ((value.first() == '"' && value.last() == '"') || (value.first() == '\'' && value.last() == '\''))
+        ) {
+            value = value.substring(1, value.length - 1).trim()
+        }
+        val actionName = value.substringAfterLast('#', value).trim().trim('"', '\'').trim()
+        return actionName.takeIf { it.isNotEmpty() }
+    }
+
+    private fun localName(element: Element): String =
+        element.localName ?: element.tagName.substringAfter(':')
+
+    private fun childElements(parent: Element): List<Element> {
+        val children = parent.childNodes
+        return (0 until children.length).mapNotNull { children.item(it) as? Element }
     }
 
     fun response(actionName: String, serviceType: String, outputs: List<Pair<String, String>>): String {
@@ -88,11 +124,12 @@ class ContentDirectoryService(
     private fun browse(arguments: Map<String, String>, baseUrl: String): List<Pair<String, String>> {
         val objectId = arguments["ObjectID"]?.takeIf { it.isNotBlank() } ?: "0"
         val browseFlag = arguments["BrowseFlag"]?.takeIf { it.isNotBlank() } ?: "BrowseDirectChildren"
+        val filter = arguments["Filter"]?.trim()?.takeIf { it.isNotEmpty() } ?: "*"
         val startingIndex = parseIndex(arguments["StartingIndex"], "StartingIndex")
         val requestedCount = parseIndex(arguments["RequestedCount"], "RequestedCount")
         val sortCriteria = arguments["SortCriteria"].orEmpty().trim()
-        val requestTrace = "Browse ObjectID=$objectId | BrowseFlag=$browseFlag | " +
-            "RequestedCount=$requestedCount | StartingIndex=$startingIndex"
+        val requestTrace = "Browse ObjectID=$objectId | BrowseFlag=$browseFlag | Filter=$filter | " +
+            "StartingIndex=$startingIndex | RequestedCount=$requestedCount | SortCriteria=$sortCriteria"
         onBrowseTrace(requestTrace, "Browse processing", repository.lastEnumerationDiagnostics)
 
         try {
