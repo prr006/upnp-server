@@ -13,6 +13,7 @@ class ServerMetrics {
     @Volatile var multicastDetails: String = "—"
     @Volatile var multicastSocketCreated: Boolean = false
     @Volatile var multicastGroupJoined: Boolean = false
+    @Volatile var ssdpInterface: String = "—"
     @Volatile var selectedFolder: String = "Not selected"
     @Volatile var serverStatus: String = "Stopped"
 }

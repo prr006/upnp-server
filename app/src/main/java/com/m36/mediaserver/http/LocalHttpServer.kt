@@ -74,12 +74,18 @@ class LocalHttpServer(
     /** Bind only the selected local IPv4 interfaces (not cellular/public interfaces). */
     fun updateAddresses(snapshot: NetworkSnapshot) {
         if (!isRunning.get()) return
-        val addresses = snapshot.addresses
-            .filter { it.priority >= MIN_BIND_PRIORITY }
+        val eligible = snapshot.eligibleAddresses
+        val addresses = eligible
             .map { it.hostAddress }
             .distinct()
             .sorted()
-        val fingerprint = addresses.joinToString("|")
+        val fingerprint = eligible
+            .map { "${it.interfaceName}:${it.hostAddress}:${it.transportType}:${it.network ?: "-"}" }
+            .distinct()
+            .sorted()
+            .joinToString("|") +
+            "#default=${snapshot.defaultInterface ?: "-"}:${snapshot.defaultTransport}" +
+            "#radio=${snapshot.radioFingerprint}"
         synchronized(listenerLock) {
             if (!isRunning.get() || fingerprint == addressFingerprint) return
             serverSockets.forEach { runCatching { it.close() } }
@@ -499,7 +505,6 @@ class LocalHttpServer(
     companion object {
         const val PORT = 8200
         private const val ACCEPT_BACKLOG = 64
-        private const val MIN_BIND_PRIORITY = 100
         private const val IO_BUFFER_SIZE = 128 * 1024
         private const val READ_TIMEOUT_MILLIS = 30_000
         private const val MAX_REQUEST_LINE_BYTES = 8 * 1024

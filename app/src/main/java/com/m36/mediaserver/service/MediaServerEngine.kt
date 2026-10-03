@@ -99,6 +99,9 @@ class MediaServerEngine(
             serverStatus = metrics.serverStatus,
             currentNetwork = snapshot.networkLabel,
             activeInterface = primary?.interfaceName ?: "—",
+            activeServerIpv4 = primary?.hostAddress ?: "—",
+            activeTransport = snapshot.activeTransport,
+            defaultTransport = snapshot.defaultTransport,
             ipv4Addresses = snapshot.displayAddresses,
             httpBindAddress = when {
                 !httpReady -> "—"
@@ -107,6 +110,7 @@ class MediaServerEngine(
             },
             httpPort = LocalHttpServer.PORT,
             ssdpStatus = metrics.ssdpStatus,
+            ssdpInterface = metrics.ssdpInterface,
             multicastSocketCreated = metrics.multicastSocketCreated,
             multicastGroupJoined = metrics.multicastGroupJoined,
             multicastDetails = metrics.multicastDetails,
@@ -191,7 +195,7 @@ class MediaServerEngine(
             ssdpServer?.updateInterfaces(detected)
         }
         val listening = httpServer?.listeningAddresses.orEmpty()
-        val hasEligibleLocalAddress = detected.addresses.any { it.priority >= MIN_LOCAL_INTERFACE_PRIORITY }
+        val hasEligibleLocalAddress = detected.eligibleAddresses.isNotEmpty()
         metrics.serverStatus = when {
             !hasEligibleLocalAddress -> "HTTP waiting for a reachable local IPv4 interface"
             listening.isEmpty() -> "Network found, but HTTP could not bind an eligible local address"
@@ -236,7 +240,6 @@ class MediaServerEngine(
     }
 
     companion object {
-        private const val MIN_LOCAL_INTERFACE_PRIORITY = 100
         private const val NETWORK_POLL_INTERVAL_MILLIS = 3_000L
     }
 }

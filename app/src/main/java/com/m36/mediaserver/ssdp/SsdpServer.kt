@@ -44,8 +44,7 @@ class SsdpServer(
             if (isClosed.get() || fingerprint == currentFingerprint) return
             sendByeByeAndCloseSockets()
             currentFingerprint = fingerprint
-            val candidates = snapshot.addresses
-                .filter { it.priority >= MIN_INTERFACE_PRIORITY }
+            val candidates = snapshot.eligibleAddresses
                 .groupBy { it.interfaceName }
                 .mapNotNull { (_, addresses) -> addresses.maxByOrNull { it.priority } }
                 .sortedByDescending { it.priority }
@@ -73,6 +72,12 @@ class SsdpServer(
             activeSockets.addAll(created)
             metrics.multicastSocketCreated = anySocketCreated
             metrics.multicastGroupJoined = created.any { it.joined }
+            metrics.ssdpInterface = created.filter { it.joined }
+                .joinToString(", ") { "${it.interfaceName} (${it.localAddress.hostAddress}; joined)" }
+                .ifBlank {
+                    candidates.joinToString(", ") { "${it.interfaceName} (${it.hostAddress}; join failed/not available)" }
+                        .ifBlank { "—" }
+                }
             metrics.multicastDetails = details.ifEmpty { listOf("No eligible active IPv4 interface") }.joinToString("; ")
             metrics.ssdpStatus = when {
                 created.any { it.joined } -> "Listening on ${created.filter { it.joined }.joinToString { it.interfaceName }}"
@@ -101,6 +106,7 @@ class SsdpServer(
             metrics.multicastDetails = "Sockets closed"
             metrics.multicastSocketCreated = false
             metrics.multicastGroupJoined = false
+            metrics.ssdpInterface = "—"
         }
         responseScheduler.shutdownNow()
     }
@@ -341,7 +347,6 @@ class SsdpServer(
         private const val CACHE_MAX_AGE_SECONDS = 1800
         private const val ALIVE_INTERVAL_SECONDS = 900L
         private const val MAX_PACKET_BYTES = 16 * 1024
-        private const val MIN_INTERFACE_PRIORITY = 100
         private val GROUP: InetAddress by lazy { InetAddress.getByName(GROUP_ADDRESS) }
         private val SERVER_HEADER: String by lazy {
             "Android/${Build.VERSION.RELEASE ?: "unknown"} UPnP/1.1 M36MediaServer/1.0"

@@ -4,179 +4,310 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.LinkProperties
+import android.net.wifi.WifiInfo
+import android.os.Build
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.SocketException
 import java.util.Collections
-import java.util.Locale
 
-/** An IPv4 endpoint and the interface Android should use for multicast on that endpoint. */
+/** An IPv4 address plus its Android transport, policy result, and multicast interface. */
 data class ReachableAddress(
     val address: Inet4Address,
     val interfaceName: String,
     val networkInterface: NetworkInterface?,
     val network: Network?,
     val priority: Int,
+    val transportType: String,
+    val candidate: Boolean,
+    val candidateReason: String,
 ) {
     val hostAddress: String get() = address.hostAddress ?: address.toString()
 }
 
+/** Immutable view of every IPv4 interface and the currently selected local server endpoint. */
 data class NetworkSnapshot(
     val networkLabel: String,
     val addresses: List<ReachableAddress>,
     val defaultInterface: String?,
+    val defaultTransport: String = "Unknown",
+    val radioFingerprint: String = "",
+    val interfacesWithoutIpv4: List<String> = emptyList(),
 ) {
-    val primaryAddress: ReachableAddress? get() = addresses.firstOrNull()
+    val eligibleAddresses: List<ReachableAddress> get() = addresses.filter { it.candidate }
+    val primaryAddress: ReachableAddress?
+        get() = eligibleAddresses.maxWithOrNull(
+            compareBy<ReachableAddress> { it.priority }
+                .thenByDescending { it.interfaceName }
+                .thenByDescending { it.hostAddress },
+        )
+    val activeTransport: String
+        get() = primaryAddress?.transportType ?: "None — no eligible LAN interface"
     val displayAddresses: List<String>
-        get() = addresses.map { "${it.interfaceName}: ${it.hostAddress}" }
+        get() = addresses.map {
+            "Interface: ${it.interfaceName} | IPv4: ${it.hostAddress} | Type: ${it.transportType} | Candidate: ${if (it.candidate) "YES" else "NO"} — ${it.candidateReason}"
+        } + interfacesWithoutIpv4
 
-    fun fingerprint(): String = addresses
-        .map { "${it.interfaceName}:${it.hostAddress}" }
-        .distinct()
-        .sorted()
-        .joinToString("|") + "#$networkLabel"
+    /** Includes selection changes, active transport changes, and Wi-Fi radio/band changes. */
+    fun fingerprint(): String = buildString {
+        append(
+            eligibleAddresses.map {
+                "${it.interfaceName}:${it.hostAddress}:${it.transportType}:${it.priority}:${it.network ?: "-"}"
+            }.sorted().joinToString("|"),
+        )
+        append("#default=").append(defaultTransport)
+        append("#radio=").append(radioFingerprint)
+    }
 }
 
 /**
- * Combines Android's routing metadata with actual up IPv4 interfaces. In particular, tethering
- * interfaces are not consistently represented by getActiveNetwork() on Android, so interface
- * enumeration is deliberately used as a second source instead of assuming a subnet or IP.
+ * Detects explicit Android Wi-Fi/Ethernet Networks first, then inspects every OS IPv4 interface
+ * for an unmapped local LAN/Soft AP. Transport capabilities, routes, interface flags and address
+ * scope are combined. Interface names are used only for deny-listing known cellular/tunnel
+ * classes, never to identify an AP (there is no assumption that an AP is named wlan0).
  */
 class NetworkAddressDetector(context: Context) {
     private val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+    private data class InterfaceFacts(
+        val networks: MutableList<Network> = ArrayList(),
+        val transports: MutableSet<NetworkTransport> = LinkedHashSet(),
+        var hasUsableIpv4Route: Boolean = false,
+    ) {
+        fun effectiveTransport(): NetworkTransport = when {
+            NetworkTransport.CELLULAR in transports -> NetworkTransport.CELLULAR
+            NetworkTransport.VPN in transports -> NetworkTransport.VPN
+            NetworkTransport.WIFI in transports -> NetworkTransport.WIFI
+            NetworkTransport.ETHERNET in transports -> NetworkTransport.ETHERNET
+            else -> NetworkTransport.OTHER
+        }
+
+        fun preferredNetwork(): Network? = networks.firstOrNull()
+    }
+
+    private data class EvidenceKey(val interfaceName: String, val address: String)
+
+    private data class AddressEvidence(
+        val address: Inet4Address,
+        val interfaceName: String,
+        var networkInterface: NetworkInterface? = null,
+        var network: Network? = null,
+        var hasUsableIpv4Route: Boolean = false,
+        var hasInterfacePrefixRoute: Boolean = false,
+        var interfaceUp: Boolean? = null,
+        var isLoopback: Boolean = false,
+        var isPointToPoint: Boolean = false,
+    )
+
     fun detect(): NetworkSnapshot {
-        val allNetworks = runCatching { connectivity.allNetworks.toList() }.getOrDefault(emptyList())
         val defaultNetwork = runCatching { connectivity.activeNetwork }.getOrNull()
-        val capabilities = HashMap<Network, NetworkCapabilities?>()
-        val properties = HashMap<Network, LinkProperties?>()
-        allNetworks.forEach { network ->
-            capabilities[network] = runCatching { connectivity.getNetworkCapabilities(network) }.getOrNull()
-            properties[network] = runCatching { connectivity.getLinkProperties(network) }.getOrNull()
-        }
+        val allNetworks = runCatching { connectivity.allNetworks.toList() }.getOrDefault(emptyList())
+        val networks = (allNetworks + listOfNotNull(defaultNetwork)).distinct()
+        val factsByInterface = LinkedHashMap<String, InterfaceFacts>()
+        val evidence = LinkedHashMap<EvidenceKey, AddressEvidence>()
+        val networkCapabilities = HashMap<Network, NetworkCapabilities?>()
+        val networkProperties = HashMap<Network, LinkProperties?>()
+        val radioDetails = ArrayList<String>()
 
-        val wifiInterfaces = HashSet<String>()
-        val defaultInterfaces = HashSet<String>()
-        val cellularInterfaces = HashSet<String>()
-        val vpnInterfaces = HashSet<String>()
-        val interfaceNetworks = HashMap<String, Network>()
-        var hasWifi = false
-        var hasCellular = false
-        var hasEthernet = false
-        var hasVpn = false
-        var defaultIsWifi = false
-        var defaultIsCellular = false
-
-        allNetworks.forEach { network ->
-            val caps = capabilities[network] ?: return@forEach
-            val iface = properties[network]?.interfaceName
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                hasWifi = true
-                if (!iface.isNullOrBlank()) {
-                    wifiInterfaces += iface
-                    interfaceNetworks[iface] = network
-                }
-            }
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
-                hasCellular = true
-                if (!iface.isNullOrBlank()) cellularInterfaces += iface
-            }
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) hasEthernet = true
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-                hasVpn = true
-                if (!iface.isNullOrBlank()) vpnInterfaces += iface
-            }
-            if (network == defaultNetwork) {
-                if (!iface.isNullOrBlank()) defaultInterfaces += iface
-                defaultIsWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-                defaultIsCellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+        fun transportFor(caps: NetworkCapabilities?): NetworkTransport {
+            if (caps == null) return NetworkTransport.OTHER
+            return when {
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> NetworkTransport.CELLULAR
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> NetworkTransport.VPN
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> NetworkTransport.WIFI
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> NetworkTransport.ETHERNET
+                else -> NetworkTransport.OTHER
             }
         }
 
-        data class CandidateKey(val iface: String, val address: String)
-        val candidates = LinkedHashMap<CandidateKey, ReachableAddress>()
-
-        fun addAddress(
-            ifaceName: String,
-            address: Inet4Address,
-            network: Network? = interfaceNetworks[ifaceName],
-            interfaceOverride: NetworkInterface? = null,
-        ) {
-            if (address.isAnyLocalAddress || address.isLoopbackAddress || address.isLinkLocalAddress) return
-            val networkInterface = interfaceOverride ?: runCatching { NetworkInterface.getByName(ifaceName) }.getOrNull()
-            val lower = ifaceName.lowercase(Locale.ROOT)
-            val isWifiLike = ifaceName in wifiInterfaces || WIFI_INTERFACE_HINT.containsMatchIn(lower)
-            val isCellularLike = ifaceName in cellularInterfaces || CELLULAR_INTERFACE_HINT.containsMatchIn(lower)
-            val isVpnLike = ifaceName in vpnInterfaces || VPN_INTERFACE_HINT.containsMatchIn(lower)
-            val priority = when {
-                isVpnLike -> -100
-                ifaceName in wifiInterfaces -> 400
-                ifaceName in defaultInterfaces && defaultIsWifi -> 390
-                isWifiLike -> 350
-                ifaceName in defaultInterfaces -> 250
-                !isCellularLike -> 150
-                else -> 10
-            }
-            val item = ReachableAddress(address, ifaceName, networkInterface, network, priority)
-            candidates[CandidateKey(ifaceName, address.hostAddress ?: address.toString())] = item
+        fun evidenceFor(name: String, address: Inet4Address): AddressEvidence {
+            val key = EvidenceKey(name, address.hostAddress ?: address.toString())
+            return evidence.getOrPut(key) { AddressEvidence(address, name) }
         }
 
-        // LinkProperties is authoritative for Android-managed Wi-Fi and Ethernet networks.
-        allNetworks.forEach { network ->
-            val iface = properties[network]?.interfaceName ?: return@forEach
-            properties[network]?.linkAddresses?.forEach { link ->
-                (link.address as? Inet4Address)?.let { addAddress(iface, it, network) }
+        networks.forEach { network ->
+            val caps = runCatching { connectivity.getNetworkCapabilities(network) }.getOrNull()
+            val properties = runCatching { connectivity.getLinkProperties(network) }.getOrNull()
+            networkCapabilities[network] = caps
+            networkProperties[network] = properties
+            val linkProperties = properties ?: return@forEach
+            val iface = linkProperties.interfaceName?.takeIf { it.isNotBlank() } ?: return@forEach
+            val facts = factsByInterface.getOrPut(iface) { InterfaceFacts() }
+            facts.networks += network
+            facts.transports += transportFor(caps)
+
+            val hasV4Route = linkProperties.routes.any { route ->
+                route.destination.address is Inet4Address
+            }
+            facts.hasUsableIpv4Route = facts.hasUsableIpv4Route || hasV4Route
+            linkProperties.linkAddresses.forEach linkLoop@{ linkAddress ->
+                val address = linkAddress.address as? Inet4Address ?: return@linkLoop
+                val item = evidenceFor(iface, address)
+                item.network = item.network ?: network
+                item.hasUsableIpv4Route = item.hasUsableIpv4Route || hasV4Route
+                item.hasInterfacePrefixRoute = item.hasInterfacePrefixRoute ||
+                    (linkAddress.prefixLength in 1..30)
+            }
+
+            val wifiInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                runCatching { caps?.transportInfo as? WifiInfo }.getOrNull()
+            } else {
+                null
+            }
+            if (transportFor(caps) == NetworkTransport.WIFI) {
+                val frequency = runCatching { wifiInfo?.frequency ?: 0 }.getOrDefault(0)
+                radioDetails += "$iface:$frequency"
             }
         }
 
-        // Tethering/AP interfaces may exist outside ConnectivityManager's app-visible network list.
+        // Enumerate every OS interface/address, including cellular, loopback and tunnel addresses,
+        // so diagnostics show why each was rejected instead of silently hiding a bad selection.
+        val interfacesWithoutIpv4 = LinkedHashMap<String, String>()
         try {
-            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
-            interfaces.forEach { networkInterface ->
-                val usable = runCatching { networkInterface.isUp && !networkInterface.isLoopback }.getOrDefault(false)
-                if (!usable) return@forEach
+            Collections.list(NetworkInterface.getNetworkInterfaces()).forEach { networkInterface ->
                 val name = networkInterface.name ?: return@forEach
-                Collections.list(networkInterface.inetAddresses).forEach { address ->
-                    (address as? Inet4Address)?.let { addAddress(name, it, interfaceOverride = networkInterface) }
+                val up = runCatching { networkInterface.isUp }.getOrDefault(false)
+                val loopback = runCatching { networkInterface.isLoopback }.getOrDefault(name == "lo")
+                val pointToPoint = runCatching { networkInterface.isPointToPoint }.getOrDefault(false)
+                val facts = factsByInterface[name]
+                val ipv4Addresses = Collections.list(networkInterface.inetAddresses).filterIsInstance<Inet4Address>()
+                val hasConnectivityIpv4 = evidence.keys.any { it.interfaceName == name }
+                if (ipv4Addresses.isEmpty() && !hasConnectivityIpv4) {
+                    val decision = LocalInterfacePolicy.evaluate(
+                        InterfacePolicyInput(
+                            interfaceName = name,
+                            transport = facts?.effectiveTransport() ?: NetworkTransport.OTHER,
+                            defaultTransport = null,
+                            interfaceUp = up,
+                            isLoopback = loopback || name == "lo",
+                            isPointToPoint = pointToPoint,
+                            hasUsableIpv4Route = facts?.hasUsableIpv4Route == true,
+                            isRfc1918Ipv4 = false,
+                            addressIsUsableLanIpv4 = false,
+                        ),
+                    )
+                    interfacesWithoutIpv4[name] =
+                        "Interface: $name | IPv4: none | Type: ${decision.transportLabel} | Candidate: NO — no IPv4 address"
+                }
+                ipv4Addresses.forEach { address ->
+                    val item = evidenceFor(name, address)
+                    item.networkInterface = networkInterface
+                    item.network = item.network ?: facts?.preferredNetwork()
+                    item.interfaceUp = up
+                    item.isLoopback = loopback || address.isLoopbackAddress
+                    item.isPointToPoint = pointToPoint
+                    val interfaceAddress = runCatching {
+                        networkInterface.interfaceAddresses.firstOrNull { it.address == address }
+                    }.getOrNull()
+                    if (interfaceAddress != null) {
+                        item.hasInterfacePrefixRoute = item.hasInterfacePrefixRoute ||
+                            interfaceAddress.networkPrefixLength.toInt() in 1..30 || interfaceAddress.broadcast != null
+                    }
+                    item.hasUsableIpv4Route = item.hasUsableIpv4Route || facts?.hasUsableIpv4Route == true
                 }
             }
         } catch (_: SocketException) {
-            // ConnectivityManager-derived addresses above remain usable when interface enumeration
-            // is restricted by an OEM build.
+            // Android ConnectivityManager evidence remains available if interface enumeration fails.
         } catch (_: SecurityException) {
-            // Best effort only; the app never needs location or broad storage permissions.
+            // Enumeration is best-effort and does not require broad permissions.
         }
 
-        val sorted = candidates.values
-            .distinctBy { "${it.interfaceName}:${it.hostAddress}" }
-            .sortedWith(compareByDescending<ReachableAddress> { it.priority }
+        // LinkProperties may contain an active IPv4 interface address even if Java interface
+        // enumeration is restricted by an OEM. Keep that address in the same diagnostics/policy path.
+        networkProperties.forEach propertiesLoop@{ (network, properties) ->
+            val linkProperties = properties ?: return@propertiesLoop
+            val iface = linkProperties.interfaceName ?: return@propertiesLoop
+            val facts = factsByInterface[iface]
+            linkProperties.linkAddresses.forEach linkLoop@{ linkAddress ->
+                val address = linkAddress.address as? Inet4Address ?: return@linkLoop
+                val item = evidenceFor(iface, address)
+                item.network = item.network ?: network
+                item.hasUsableIpv4Route = item.hasUsableIpv4Route || facts?.hasUsableIpv4Route == true
+                item.hasInterfacePrefixRoute = item.hasInterfacePrefixRoute || linkAddress.prefixLength in 1..30
+                if (item.interfaceUp == null) item.interfaceUp = facts != null
+            }
+        }
+
+        val defaultCaps = defaultNetwork?.let { networkCapabilities[it] }
+            ?: defaultNetwork?.let { runCatching { connectivity.getNetworkCapabilities(it) }.getOrNull() }
+        val defaultTransport = transportFor(defaultCaps)
+        val defaultInterface = defaultNetwork?.let { networkProperties[it]?.interfaceName }
+        val addresses = evidence.values.map { item ->
+            val facts = factsByInterface[item.interfaceName]
+            val transport = facts?.effectiveTransport() ?: NetworkTransport.OTHER
+            val hasRoute = item.hasUsableIpv4Route || item.hasInterfacePrefixRoute
+            val usableAddress = !item.address.isAnyLocalAddress &&
+                !item.address.isLoopbackAddress &&
+                !item.address.isLinkLocalAddress &&
+                !item.address.isMulticastAddress
+            val decision = LocalInterfacePolicy.evaluate(
+                InterfacePolicyInput(
+                    interfaceName = item.interfaceName,
+                    transport = transport,
+                    defaultTransport = defaultTransport,
+                    interfaceUp = item.interfaceUp ?: (facts != null),
+                    isLoopback = item.isLoopback || item.interfaceName == "lo",
+                    isPointToPoint = item.isPointToPoint,
+                    hasUsableIpv4Route = hasRoute,
+                    isRfc1918Ipv4 = item.address.isRfc1918Address(),
+                    addressIsUsableLanIpv4 = usableAddress,
+                ),
+            )
+            ReachableAddress(
+                address = item.address,
+                interfaceName = item.interfaceName,
+                networkInterface = item.networkInterface,
+                network = item.network ?: facts?.preferredNetwork(),
+                priority = decision.priority,
+                transportType = decision.transportLabel,
+                candidate = decision.candidate,
+                candidateReason = decision.reason,
+            )
+        }.sortedWith(
+            compareByDescending<ReachableAddress> { it.candidate }
+                .thenByDescending { it.priority }
                 .thenBy { it.interfaceName }
-                .thenBy { it.hostAddress })
+                .thenBy { it.hostAddress },
+        )
 
-        val defaultCaps = defaultNetwork?.let { capabilities[it] }
-        val hasWifiLikeInterface = sorted.any { WIFI_INTERFACE_HINT.containsMatchIn(it.interfaceName.lowercase(Locale.ROOT)) }
-        val hasEligibleLocalInterface = sorted.any { it.priority >= MIN_LOCAL_INTERFACE_PRIORITY }
+        val primary = addresses.firstOrNull { it.candidate }
+        val defaultTransportLabel = if (defaultNetwork == null) {
+            "None"
+        } else {
+            when (defaultTransport) {
+                NetworkTransport.WIFI -> "Wi-Fi"
+                NetworkTransport.CELLULAR -> "Cellular / WWAN"
+                NetworkTransport.VPN -> "VPN / tunnel"
+                NetworkTransport.ETHERNET -> "Ethernet"
+                NetworkTransport.OTHER -> "Other / unclassified"
+            }
+        }
         val label = when {
-            defaultCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "Wi-Fi"
-            defaultCaps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> "Ethernet"
-            hasWifi && defaultIsWifi -> "Wi-Fi"
-            hasWifiLikeInterface && !defaultIsWifi -> "Wi-Fi hotspot / local AP"
-            hasWifi -> "Wi-Fi network"
-            hasEthernet -> "Ethernet"
-            hasEligibleLocalInterface -> "Local network interface"
-            hasVpn -> "VPN active; no local Wi-Fi interface detected"
-            defaultIsCellular || hasCellular -> "Cellular (no reachable local IPv4 found)"
-            sorted.isNotEmpty() -> "No eligible local interface detected"
-            else -> "No active local network"
+            primary != null -> primary.transportType
+            defaultNetwork == null -> "No active network"
+            defaultTransport == NetworkTransport.CELLULAR -> "Cellular default active — no eligible LAN interface"
+            defaultTransport == NetworkTransport.VPN -> "VPN default active — no eligible Wi-Fi/Soft AP/LAN interface"
+            defaultTransport == NetworkTransport.WIFI -> "Wi-Fi connected — no usable local IPv4 route"
+            else -> "$defaultTransportLabel active — no eligible local LAN interface"
         }
 
-        return NetworkSnapshot(label, sorted, defaultInterfaces.firstOrNull())
+        return NetworkSnapshot(
+            networkLabel = label,
+            addresses = addresses,
+            defaultInterface = defaultInterface,
+            defaultTransport = defaultTransportLabel,
+            radioFingerprint = radioDetails.sorted().joinToString(","),
+            interfacesWithoutIpv4 = interfacesWithoutIpv4.values.sorted(),
+        )
     }
 
-    companion object {
-        private const val MIN_LOCAL_INTERFACE_PRIORITY = 100
-        private val WIFI_INTERFACE_HINT = Regex("(^|[^a-z])(wlan|wifi|ap|swlan)([0-9_]*|[^a-z].*)?", RegexOption.IGNORE_CASE)
-        private val CELLULAR_INTERFACE_HINT = Regex("(rmnet|ccmni|pdp[_-]?ip|wwan|cellular|rmnet_data)", RegexOption.IGNORE_CASE)
-        private val VPN_INTERFACE_HINT = Regex("(^|[^a-z])(tun|tap|wg|utun|ppp)[0-9_]*", RegexOption.IGNORE_CASE)
+    private fun Inet4Address.isRfc1918Address(): Boolean {
+        val octets = address.map { it.toInt() and 0xff }
+        return when {
+            octets[0] == 10 -> true
+            octets[0] == 172 && octets[1] in 16..31 -> true
+            octets[0] == 192 && octets[1] == 168 -> true
+            else -> false
+        }
     }
 }

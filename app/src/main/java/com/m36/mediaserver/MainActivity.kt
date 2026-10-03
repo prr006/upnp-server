@@ -231,18 +231,27 @@ class MainActivity : Activity() {
         detailsView.text = buildString {
             appendLine("Server: ${diagnostics.serverStatus}")
             appendLine("Network: ${diagnostics.currentNetwork}")
-            appendLine("Active interface: ${diagnostics.activeInterface}")
-            appendLine("Detected IPv4 addresses: ${diagnostics.ipv4Addresses.joinToString("; ").ifBlank { "none" }}")
-            appendLine("HTTP: ${diagnostics.httpBindAddress}:${diagnostics.httpPort}")
-            appendLine("SSDP: ${diagnostics.ssdpStatus}")
+            appendLine("Selected server transport: ${diagnostics.activeTransport}")
+            appendLine("Default network transport: ${diagnostics.defaultTransport}")
+            appendLine("Active server interface: ${diagnostics.activeInterface}")
+            appendLine("Active server IPv4: ${diagnostics.activeServerIpv4}")
+            appendLine("All interfaces / IPv4 addresses:")
+            if (diagnostics.ipv4Addresses.isEmpty()) {
+                appendLine("  (none detected)")
+            } else {
+                diagnostics.ipv4Addresses.forEach { appendLine("  • $it") }
+            }
+            appendLine("HTTP address(es): ${diagnostics.httpBindAddress}:${diagnostics.httpPort}")
+            appendLine("SSDP interface(s): ${diagnostics.ssdpInterface}")
+            appendLine("SSDP status: ${diagnostics.ssdpStatus}")
             appendLine("Multicast group: ${diagnostics.multicastAddress}")
             appendLine("Multicast socket created: ${diagnostics.multicastSocketCreated}")
             appendLine("Multicast group joined: ${diagnostics.multicastGroupJoined}")
             appendLine("Socket details: ${diagnostics.multicastDetails}")
-            appendLine("M-SEARCH requests: ${diagnostics.mSearchCount}")
+            appendLine("M-SEARCH count: ${diagnostics.mSearchCount}")
             appendLine("Last SSDP request: ${diagnostics.lastSsdpRequest}")
             appendLine("SSDP responses sent: ${diagnostics.ssdpResponsesSent}")
-            appendLine("HTTP requests: ${diagnostics.httpRequestCount}")
+            appendLine("HTTP request count: ${diagnostics.httpRequestCount}")
             appendLine("Last HTTP request: ${diagnostics.lastHttpRequest}")
             append("Selected shared folder: ${diagnostics.selectedFolder.takeIf { it != "Not selected" } ?: selectedFolderName}")
         }
