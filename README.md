@@ -69,12 +69,12 @@ The app's **Show Details** panel is intended for diagnosing the first tethering 
 
 - SSDP multicast listener on `239.255.255.250:1900`, per-interface memberships, `M-SEARCH` responses, startup/periodic `ssdp:alive` and shutdown/network-change `ssdp:byebye` notifications.
 - Stable persisted device UUID, UPnP root device description, ContentDirectory and ConnectionManager service descriptions/control URLs.
-- ContentDirectory `Browse` (`BrowseDirectChildren` and `BrowseMetadata`), `GetSearchCapabilities`, `GetSortCapabilities`, and `GetSystemUpdateID`; browse paging and `dc:title` sorting; XML-escaped DIDL-Lite containers with SAF-derived `childCount`, stable item/parent IDs, and reachable per-item HTTP resources.
+- ContentDirectory service advertisement and SCPD with the required browse/capability/update actions and arguments; `BrowseDirectChildren` and `BrowseMetadata`, paging and `dc:title` sorting; XML-escaped DIDL-Lite containers with SAF-derived `childCount`, stable item/parent IDs, and reachable per-item HTTP resources.
 - SAF-only read-only directory traversal. Files become HTTP-addressable only after appearing in a browsed directory; HTTP paths do not accept filesystem paths.
 - HTTP GET/HEAD, correct MIME types for common media (including Matroska), streaming buffers, known-length responses and single byte-range/suffix-range handling for seeking. No full-file buffering and no transcoding.
 - Android `ConnectivityManager` callbacks plus interface enumeration and a periodic fallback poll. Selection prefers a non-VPN Android Wi-Fi Network with an IPv4 route; cellular/WWAN, loopback, VPN/tunnel and point-to-point interfaces are always rejected, regardless of default-route priority. When Android does not expose the Soft AP as a Wi-Fi Network, the detector infers a local hotspot/LAN from an up non-cellular interface with a private IPv4 address and connected subnet route; no AP interface name or fixed device subnet is assumed. SSDP is recreated and HTTP listeners rebound when the eligible LAN, default transport, or observable Wi-Fi frequency changes. HTTP binds only to eligible local IPv4 addresses.
 - Foreground service, persistent stop notification, multicast lock and partial CPU wake lock while serving. The CPU wake lock helps keep transfers alive with the phone screen off, at the cost of battery while the server is left running.
-- Live diagnostics for interface/address selection, socket/group status, SSDP counts, HTTP counts and last requests, plus the latest ContentDirectory Browse arguments/results and SAF traversal outcome.
+- Live diagnostics for interface/address selection, socket/group status and request counts, including GETs for `/rootDesc.xml` and the ContentDirectory SCPD, hits to the ContentDirectory control URL, the exact advertised service type/ID and endpoint URLs (resolved against the active interface), Browse arguments/results, and the last SAF traversal.
 
 ## Limitations / test status
 

@@ -9,13 +9,44 @@ object UpnpXml {
     const val CONNECTION_MANAGER_TYPE = "urn:schemas-upnp-org:service:ConnectionManager:1"
     const val CONTENT_DIRECTORY_ID = "urn:upnp-org:serviceId:ContentDirectory"
     const val CONNECTION_MANAGER_ID = "urn:upnp-org:serviceId:ConnectionManager"
+    const val CONTENT_DIRECTORY_SCPD_PATH = "/ContentDirectory/scpd.xml"
+    const val CONTENT_DIRECTORY_CONTROL_PATH = "/upnp/control/contentdirectory"
+    const val CONTENT_DIRECTORY_EVENT_PATH = "/upnp/event/contentdirectory"
+
+    data class ContentDirectoryEndpoints(
+        val serviceType: String,
+        val serviceId: String,
+        val scpdUrl: String,
+        val controlUrl: String,
+        val eventSubUrl: String,
+        val resolvedScpdUrl: String,
+        val resolvedControlUrl: String,
+        val resolvedEventSubUrl: String,
+    )
+
+    /** Returns the exact service values written into rootDesc.xml plus their active-interface URLs. */
+    fun contentDirectoryEndpoints(baseUrl: String): ContentDirectoryEndpoints {
+        val normalizedBase = baseUrl.trimEnd('/')
+        return ContentDirectoryEndpoints(
+            serviceType = CONTENT_DIRECTORY_TYPE,
+            serviceId = CONTENT_DIRECTORY_ID,
+            scpdUrl = CONTENT_DIRECTORY_SCPD_PATH,
+            controlUrl = CONTENT_DIRECTORY_CONTROL_PATH,
+            eventSubUrl = CONTENT_DIRECTORY_EVENT_PATH,
+            resolvedScpdUrl = normalizedBase + CONTENT_DIRECTORY_SCPD_PATH,
+            resolvedControlUrl = normalizedBase + CONTENT_DIRECTORY_CONTROL_PATH,
+            resolvedEventSubUrl = normalizedBase + CONTENT_DIRECTORY_EVENT_PATH,
+        )
+    }
 
     fun rootDescription(deviceUuid: String, baseUrl: String): String {
         val normalizedBase = baseUrl.trimEnd('/') + "/"
+        val contentDirectory = contentDirectoryEndpoints(baseUrl)
         val udn = "uuid:$deviceUuid"
         return """
             <?xml version="1.0" encoding="utf-8"?>
-            <root xmlns="urn:schemas-upnp-org:device-1-0">
+            <root xmlns="urn:schemas-upnp-org:device-1-0"
+                  xmlns:dlna="urn:schemas-dlna-org:device-1-0">
               <specVersion><major>1</major><minor>0</minor></specVersion>
               <URLBase>${xmlEscape(normalizedBase)}</URLBase>
               <device>
@@ -28,13 +59,14 @@ object UpnpXml {
                 <modelNumber>1</modelNumber>
                 <serialNumber>${xmlEscape(deviceUuid.take(12))}</serialNumber>
                 <UDN>$udn</UDN>
+                <dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>
                 <serviceList>
                   <service>
-                    <serviceType>$CONTENT_DIRECTORY_TYPE</serviceType>
-                    <serviceId>$CONTENT_DIRECTORY_ID</serviceId>
-                    <SCPDURL>/ContentDirectory/scpd.xml</SCPDURL>
-                    <controlURL>/upnp/control/contentdirectory</controlURL>
-                    <eventSubURL>/upnp/event/contentdirectory</eventSubURL>
+                    <serviceType>${contentDirectory.serviceType}</serviceType>
+                    <serviceId>${contentDirectory.serviceId}</serviceId>
+                    <SCPDURL>${contentDirectory.scpdUrl}</SCPDURL>
+                    <controlURL>${contentDirectory.controlUrl}</controlURL>
+                    <eventSubURL>${contentDirectory.eventSubUrl}</eventSubURL>
                   </service>
                   <service>
                     <serviceType>$CONNECTION_MANAGER_TYPE</serviceType>
@@ -64,7 +96,7 @@ object UpnpXml {
               <argument><name>Result</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable></argument>
               <argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
               <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
-              <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument>
+              <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>
             </argumentList></action>
             <action><name>GetSearchCapabilities</name><argumentList>
               <argument><name>SearchCaps</name><direction>out</direction><relatedStateVariable>SearchCapabilities</relatedStateVariable></argument>
@@ -78,12 +110,19 @@ object UpnpXml {
           </actionList>
           <serviceStateTable>
             <stateVariable sendEvents="no"><name>A_ARG_TYPE_ObjectID</name><dataType>string</dataType></stateVariable>
-            <stateVariable sendEvents="no"><name>A_ARG_TYPE_BrowseFlag</name><dataType>string</dataType></stateVariable>
+            <stateVariable sendEvents="no">
+              <name>A_ARG_TYPE_BrowseFlag</name><dataType>string</dataType>
+              <allowedValueList>
+                <allowedValue>BrowseMetadata</allowedValue>
+                <allowedValue>BrowseDirectChildren</allowedValue>
+              </allowedValueList>
+            </stateVariable>
             <stateVariable sendEvents="no"><name>A_ARG_TYPE_Filter</name><dataType>string</dataType></stateVariable>
             <stateVariable sendEvents="no"><name>A_ARG_TYPE_Index</name><dataType>ui4</dataType></stateVariable>
             <stateVariable sendEvents="no"><name>A_ARG_TYPE_Count</name><dataType>ui4</dataType></stateVariable>
             <stateVariable sendEvents="no"><name>A_ARG_TYPE_SortCriteria</name><dataType>string</dataType></stateVariable>
             <stateVariable sendEvents="no"><name>A_ARG_TYPE_Result</name><dataType>string</dataType></stateVariable>
+            <stateVariable sendEvents="no"><name>A_ARG_TYPE_UpdateID</name><dataType>ui4</dataType></stateVariable>
             <stateVariable sendEvents="no"><name>SearchCapabilities</name><dataType>string</dataType></stateVariable>
             <stateVariable sendEvents="no"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>
             <stateVariable sendEvents="yes"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable>

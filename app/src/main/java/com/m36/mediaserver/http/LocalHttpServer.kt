@@ -180,13 +180,36 @@ class LocalHttpServer(
     private fun handle(socket: Socket, output: BufferedOutputStream, request: HttpRequest) {
         val rawPath = request.path.trimEnd('/').ifBlank { "/" }
         val path = rawPath.lowercase(Locale.ROOT)
+        if (isContentDirectoryControl(path)) {
+            metrics.contentDirectoryControlRequestCount.incrementAndGet()
+            metrics.lastContentDirectoryControlRequest =
+                "${request.method} ${request.path} from ${socket.inetAddress.hostAddress}"
+        }
         when {
             request.method == "GET" && (path == "/" || path == "/rootdesc.xml" || path == "/devicedesc.xml") -> {
                 val baseUrl = baseUrlFor(socket)
+                if (path == "/rootdesc.xml") {
+                    metrics.rootDescriptionGetCount.incrementAndGet()
+                    metrics.lastRootDescriptionGet =
+                        "GET ${request.path} from ${socket.inetAddress.hostAddress} (served at $baseUrl)"
+                    val endpoints = UpnpXml.contentDirectoryEndpoints(baseUrl)
+                    metrics.advertisedContentDirectoryServiceType = endpoints.serviceType
+                    metrics.advertisedContentDirectoryServiceId = endpoints.serviceId
+                    metrics.advertisedContentDirectoryScpdUrl =
+                        "${endpoints.scpdUrl} -> ${endpoints.resolvedScpdUrl}"
+                    metrics.advertisedContentDirectoryControlUrl =
+                        "${endpoints.controlUrl} -> ${endpoints.resolvedControlUrl}"
+                    metrics.advertisedContentDirectoryEventSubUrl =
+                        "${endpoints.eventSubUrl} -> ${endpoints.resolvedEventSubUrl}"
+                }
                 writeText(output, 200, "OK", UpnpXml.rootDescription(deviceUuid, baseUrl), "text/xml; charset=\"utf-8\"")
             }
-            request.method == "GET" && path == "/contentdirectory/scpd.xml" ->
+            request.method == "GET" && isContentDirectoryScpd(path) -> {
+                metrics.contentDirectoryScpdGetCount.incrementAndGet()
+                metrics.lastContentDirectoryScpdGet =
+                    "GET ${request.path} from ${socket.inetAddress.hostAddress} (200 OK)"
                 writeText(output, 200, "OK", UpnpXml.contentDirectoryScpd(), "text/xml; charset=\"utf-8\"")
+            }
             request.method == "GET" && path == "/connectionmanager/scpd.xml" ->
                 writeText(output, 200, "OK", UpnpXml.connectionManagerScpd(), "text/xml; charset=\"utf-8\"")
             request.method == "POST" && isContentDirectoryControl(path) ->
@@ -386,13 +409,19 @@ class LocalHttpServer(
         return "http://$address:$PORT"
     }
 
+    private fun isContentDirectoryScpd(path: String): Boolean =
+        path == UpnpXml.CONTENT_DIRECTORY_SCPD_PATH.lowercase(Locale.ROOT)
+
     private fun isContentDirectoryControl(path: String): Boolean =
-        path == "/upnp/control/contentdirectory" || path == "/contentdirectory/control"
+        path == UpnpXml.CONTENT_DIRECTORY_CONTROL_PATH.lowercase(Locale.ROOT) ||
+            path == "/contentdirectory/control"
 
     private fun isConnectionManagerControl(path: String): Boolean =
         path == "/upnp/control/connectionmanager" || path == "/connectionmanager/control"
 
-    private fun isEventPath(path: String): Boolean = path == "/upnp/event/contentdirectory" || path == "/upnp/event/connectionmanager"
+    private fun isEventPath(path: String): Boolean =
+        path == UpnpXml.CONTENT_DIRECTORY_EVENT_PATH.lowercase(Locale.ROOT) ||
+            path == "/upnp/event/connectionmanager"
 
     private fun readRequest(input: BufferedInputStream): HttpRequest? {
         val requestLine = readAsciiLine(input, MAX_REQUEST_LINE_BYTES) ?: return null
