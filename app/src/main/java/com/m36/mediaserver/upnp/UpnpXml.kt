@@ -102,10 +102,10 @@ object UpnpXml {
               <argument><name>SearchCaps</name><direction>out</direction><relatedStateVariable>SearchCapabilities</relatedStateVariable></argument>
             </argumentList></action>
             <action><name>GetSortCapabilities</name><argumentList>
-              <argument><name>SortCaps</name><direction>out</direction><relatedStateVariable>SortCapabilities</relatedStateVariable>
+              <argument><name>SortCaps</name><direction>out</direction><relatedStateVariable>SortCapabilities</relatedStateVariable></argument>
             </argumentList></action>
             <action><name>GetSystemUpdateID</name><argumentList>
-              <argument><name>Id</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable>
+              <argument><name>Id</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument>
             </argumentList></action>
           </actionList>
           <serviceStateTable>

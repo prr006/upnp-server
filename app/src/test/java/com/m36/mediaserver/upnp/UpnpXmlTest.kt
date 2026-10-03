@@ -104,40 +104,68 @@ class UpnpXmlTest {
         assertTrue(actionNames.containsAll(setOf("Browse", "GetSearchCapabilities", "GetSortCapabilities", "GetSystemUpdateID")))
         val actionElements = (0 until actions.length).map { actions.item(it) as Element }
         fun action(name: String) = actionElements.first { childText(it, "name") == name }
-        fun argumentNames(action: Element) = (0 until action.getElementsByTagNameNS(SERVICE_NS, "argument").length)
-            .map { childText(action.getElementsByTagNameNS(SERVICE_NS, "argument").item(it) as Element, "name") }
+        fun arguments(action: Element): List<Element> {
+            val nodes = action.getElementsByTagNameNS(SERVICE_NS, "argument")
+            return (0 until nodes.length).map { nodes.item(it) as Element }
+        }
+        fun argumentNames(action: Element) = arguments(action).map { childText(it, "name") }
+        fun argumentMappings(action: Element) = arguments(action).associate { argument ->
+            childText(argument, "name") to
+                (childText(argument, "direction") to childText(argument, "relatedStateVariable"))
+        }
+
         assertEquals(listOf("SearchCaps"), argumentNames(action("GetSearchCapabilities")))
+        assertEquals(
+            mapOf("SearchCaps" to ("out" to "SearchCapabilities")),
+            argumentMappings(action("GetSearchCapabilities")),
+        )
         assertEquals(listOf("SortCaps"), argumentNames(action("GetSortCapabilities")))
+        assertEquals(
+            mapOf("SortCaps" to ("out" to "SortCapabilities")),
+            argumentMappings(action("GetSortCapabilities")),
+        )
         assertEquals(listOf("Id"), argumentNames(action("GetSystemUpdateID")))
+        assertEquals(
+            mapOf("Id" to ("out" to "SystemUpdateID")),
+            argumentMappings(action("GetSystemUpdateID")),
+        )
 
         val browse = action("Browse")
-        val arguments = browse.getElementsByTagNameNS(SERVICE_NS, "argument")
-        val argumentNames = (0 until arguments.length).map { childText(arguments.item(it) as Element, "name") }
-        assertEquals(
-            listOf(
-                "ObjectID", "BrowseFlag", "Filter", "StartingIndex", "RequestedCount", "SortCriteria",
-                "Result", "NumberReturned", "TotalMatches", "UpdateID",
-            ),
-            argumentNames,
+        val expectedBrowseArgumentNames = listOf(
+            "ObjectID", "BrowseFlag", "Filter", "StartingIndex", "RequestedCount", "SortCriteria",
+            "Result", "NumberReturned", "TotalMatches", "UpdateID",
         )
-        val updateIdArgument = (0 until arguments.length)
-            .map { arguments.item(it) as Element }
-            .first { childText(it, "name") == "UpdateID" }
-        assertEquals("out", childText(updateIdArgument, "direction"))
-        assertEquals("A_ARG_TYPE_UpdateID", childText(updateIdArgument, "relatedStateVariable"))
+        assertEquals(expectedBrowseArgumentNames, argumentNames(browse))
+        val expectedBrowseMappings = linkedMapOf(
+            "ObjectID" to ("in" to "A_ARG_TYPE_ObjectID"),
+            "BrowseFlag" to ("in" to "A_ARG_TYPE_BrowseFlag"),
+            "Filter" to ("in" to "A_ARG_TYPE_Filter"),
+            "StartingIndex" to ("in" to "A_ARG_TYPE_Index"),
+            "RequestedCount" to ("in" to "A_ARG_TYPE_Count"),
+            "SortCriteria" to ("in" to "A_ARG_TYPE_SortCriteria"),
+            "Result" to ("out" to "A_ARG_TYPE_Result"),
+            "NumberReturned" to ("out" to "A_ARG_TYPE_Count"),
+            "TotalMatches" to ("out" to "A_ARG_TYPE_Count"),
+            "UpdateID" to ("out" to "A_ARG_TYPE_UpdateID"),
+        )
+        val actualBrowseMappings = argumentMappings(browse)
+        assertEquals(expectedBrowseMappings, actualBrowseMappings)
+        assertEquals(6, actualBrowseMappings.values.count { it.first == "in" })
+        assertEquals(4, actualBrowseMappings.values.count { it.first == "out" })
+        assertEquals("A_ARG_TYPE_UpdateID", actualBrowseMappings.getValue("UpdateID").second)
+        assertEquals("SystemUpdateID", argumentMappings(action("GetSystemUpdateID")).getValue("Id").second)
 
         val stateVariables = root.getElementsByTagNameNS(SERVICE_NS, "stateVariable")
-        val browseFlag = (0 until stateVariables.length)
-            .map { stateVariables.item(it) as Element }
-            .first { childText(it, "name") == "A_ARG_TYPE_BrowseFlag" }
+        val stateVariableElements = (0 until stateVariables.length).map { stateVariables.item(it) as Element }
+        val stateVariableByName = stateVariableElements.associateBy { childText(it, "name") }
+        val browseFlag = stateVariableByName.getValue("A_ARG_TYPE_BrowseFlag")
         val allowedValues = browseFlag.getElementsByTagNameNS(SERVICE_NS, "allowedValue")
         assertEquals(
             listOf("BrowseMetadata", "BrowseDirectChildren"),
             (0 until allowedValues.length).map { allowedValues.item(it).textContent },
         )
-        val stateVariableElements = (0 until stateVariables.length).map { stateVariables.item(it) as Element }
-        val updateIdStateVariable = stateVariableElements.first { childText(it, "name") == "A_ARG_TYPE_UpdateID" }
-        assertEquals("ui4", childText(updateIdStateVariable, "dataType"))
+        assertEquals("ui4", childText(stateVariableByName.getValue("A_ARG_TYPE_UpdateID"), "dataType"))
+        assertEquals("ui4", childText(stateVariableByName.getValue("SystemUpdateID"), "dataType"))
     }
 
     @Test
