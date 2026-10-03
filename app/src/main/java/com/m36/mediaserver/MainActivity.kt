@@ -118,7 +118,7 @@ class MainActivity : Activity() {
 
     private fun buildUi() {
         val scroll = ScrollView(this).apply {
-            fillViewport = true
+            setFillViewport(true)
             setBackgroundColor(0xFFF4F6F8.toInt())
         }
         val content = LinearLayout(this).apply {
