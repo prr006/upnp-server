@@ -18,6 +18,7 @@ import javax.xml.parsers.DocumentBuilderFactory
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.w3c.dom.Element
@@ -25,9 +26,9 @@ import org.xml.sax.InputSource
 
 class MediaHttpResponseWriterTest {
     @Test
-    fun representativeMkvHasVideoDIDLMetadataAndServesExactBytesInHttp200() {
+    fun mkvDidlMetadataAndInitialFullGetPreserveTheExactSourceBytes() {
         val bytes = sampleMkvBytes()
-        val title = "S01E01.mkv"
+        val title = "Sakamoto Days E13.mkv"
         val url = "http://192.0.2.22:8200/media/mkv-token"
         val node = MediaNode(
             objectId = "i:mkv-token",
@@ -47,6 +48,7 @@ class MediaHttpResponseWriterTest {
         assertFalse(didl.contains("object.item.audioItem"))
         assertTrue(didl.contains("protocolInfo=\"http-get:*:video/x-matroska:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\""))
         assertFalse(didl.contains("DLNA.ORG_PN="))
+        assertFalse(didl.contains("duration="))
         assertTrue(didl.contains("size=\"${bytes.size}\""))
         assertTrue(didl.contains(">$url</res>"))
         val didlDocument = parseXml(
@@ -58,191 +60,357 @@ class MediaHttpResponseWriterTest {
         assertEquals(url, resource.textContent)
 
         val media = TemporaryMkvPayload(bytes)
-        val resultBytes = ByteArrayOutputStream()
+        val output = ByteArrayOutputStream()
         val result = media.use { source ->
             MediaHttpResponseWriter.serve(
-                output = BufferedOutputStream(resultBytes),
+                output = BufferedOutputStream(output),
                 method = "GET",
                 rangeHeader = null,
                 title = title,
                 reportedMimeType = "application/octet-stream",
                 media = source,
+                didlSize = bytes.size.toLong(),
             )
         }
-        val response = parseResponse(resultBytes.toByteArray())
+        val response = parseResponse(output.toByteArray())
 
+        assertEquals("FULL_GET", result.requestKind)
         assertEquals(200, result.status)
         assertEquals("HTTP/1.1 200 OK", response.statusLine)
         assertEquals("video/x-matroska", response.headers["content-type"])
         assertEquals(bytes.size.toString(), response.headers["content-length"])
         assertEquals("bytes", response.headers["accept-ranges"])
-        assertFalse(response.headers.containsKey("content-encoding"))
+        assertEquals("close", response.headers["connection"])
         assertFalse(response.headers.containsKey("transfer-encoding"))
+        assertFalse(response.headers.containsKey("content-encoding"))
         assertTrue(result.complete)
-        assertEquals(0L, result.byteOffset)
-        assertEquals(bytes.size.toLong(), result.bytesServed)
+        assertEquals(0L, result.actualMediaStartOffset)
+        assertEquals(bytes.lastIndex.toLong(), result.actualMediaEndOffsetInclusive)
+        assertEquals(5L, result.actualSourceStartOffset)
+        assertEquals((bytes.lastIndex + 5).toLong(), result.actualSourceEndOffsetInclusive)
+        assertEquals(bytes.size.toLong(), result.bytesRead)
+        assertEquals(bytes.size.toLong(), result.bytesWritten)
         assertArrayEquals(bytes, response.body)
         assertEquals(0L, media.lastSeekRelativeOffset)
-        assertEquals(5L, result.sourceByteOffset)
     }
 
     @Test
-    fun nonZeroAndOpenEndedRangesReturnExact206OffsetsLengthsAndOriginalBytes() {
+    fun headReturnsRepresentationMetadataButNoBody() {
+        val bytes = sampleMkvBytes()
+        val output = ByteArrayOutputStream()
+        val result = TemporaryMkvPayload(bytes).use { source ->
+            MediaHttpResponseWriter.serve(
+                output = BufferedOutputStream(output),
+                method = "HEAD",
+                rangeHeader = null,
+                title = "Sakamoto Days E13.mkv",
+                reportedMimeType = "application/octet-stream",
+                media = source,
+                didlSize = bytes.size.toLong(),
+            )
+        }
+        val response = parseResponse(output.toByteArray())
+
+        assertEquals("HEAD", result.requestKind)
+        assertEquals(200, result.status)
+        assertEquals("video/x-matroska", response.headers["content-type"])
+        assertEquals(bytes.size.toString(), response.headers["content-length"])
+        assertEquals("bytes", response.headers["accept-ranges"])
+        assertTrue(response.body.isEmpty())
+        assertEquals(0L, result.bytesRead)
+        assertEquals(0L, result.bytesWritten)
+        assertTrue(result.complete)
+    }
+
+    @Test
+    fun boundedAndOpenEndedRangesReturnExact206HeadersAndReadFromRequestedOffset() {
         val bytes = sampleMkvBytes()
         val start = 12_347
         val end = 45_678
-        val rangeMedia = TemporaryMkvPayload(bytes)
-        val rangeResponseBytes = ByteArrayOutputStream()
-        val rangeResult = rangeMedia.use { source ->
-            MediaHttpResponseWriter.serve(
-                output = BufferedOutputStream(rangeResponseBytes),
-                method = "GET",
-                rangeHeader = "bytes=$start-$end",
-                title = "S01E01.mkv",
-                reportedMimeType = "application/octet-stream",
-                media = source,
-            )
-        }
-        val response = parseResponse(rangeResponseBytes.toByteArray())
-        val expectedRangeBytes = bytes.copyOfRange(start, end + 1)
+        val bounded = serve(bytes, "GET", "bytes=$start-$end")
+        val boundedBody = bytes.copyOfRange(start, end + 1)
 
-        assertEquals(206, rangeResult.status)
-        assertEquals("HTTP/1.1 206 Partial Content", response.statusLine)
-        assertEquals("bytes $start-$end/${bytes.size}", response.headers["content-range"])
-        assertEquals(expectedRangeBytes.size.toString(), response.headers["content-length"])
-        assertEquals("video/x-matroska", response.headers["content-type"])
-        assertEquals("bytes", response.headers["accept-ranges"])
-        assertEquals(start.toLong(), rangeResult.byteOffset)
-        assertEquals((start + 5).toLong(), rangeResult.sourceByteOffset)
-        assertEquals(expectedRangeBytes.size.toLong(), rangeResult.bytesServed)
-        assertEquals(start.toLong(), rangeMedia.lastSeekRelativeOffset)
-        assertTrue(rangeResult.complete)
-        assertArrayEquals(expectedRangeBytes, response.body)
+        assertEquals("BOUNDED_RANGE", bounded.result.requestKind)
+        assertEquals(start.toLong(), bounded.result.requestedStartOffset)
+        assertEquals(end.toLong(), bounded.result.requestedEndOffset)
+        assertEquals(206, bounded.result.status)
+        assertEquals("bytes $start-$end/${bytes.size}", bounded.response.headers["content-range"])
+        assertEquals(boundedBody.size.toString(), bounded.response.headers["content-length"])
+        assertEquals("video/x-matroska", bounded.response.headers["content-type"])
+        assertEquals("bytes", bounded.response.headers["accept-ranges"])
+        assertEquals("close", bounded.response.headers["connection"])
+        assertFalse(bounded.response.headers.containsKey("transfer-encoding"))
+        assertEquals(start.toLong(), bounded.result.actualMediaStartOffset)
+        assertEquals(end.toLong(), bounded.result.actualMediaEndOffsetInclusive)
+        assertEquals((start + 5).toLong(), bounded.result.actualSourceStartOffset)
+        assertEquals((end + 5).toLong(), bounded.result.actualSourceEndOffsetInclusive)
+        assertEquals(boundedBody.size.toLong(), bounded.result.bytesRead)
+        assertEquals(boundedBody.size.toLong(), bounded.result.bytesWritten)
+        assertTrue(bounded.result.complete)
+        assertArrayEquals(boundedBody, bounded.response.body)
 
-        val openEndedStart = bytes.size - 997
-        val openEndedMedia = TemporaryMkvPayload(bytes)
-        val openEndedResponseBytes = ByteArrayOutputStream()
-        val openEndedResult = openEndedMedia.use { source ->
+        val initialProbe = serve(bytes, "GET", "bytes=0-1023")
+        assertEquals("BOUNDED_RANGE", initialProbe.result.requestKind)
+        assertEquals(206, initialProbe.result.status)
+        assertEquals("bytes 0-1023/${bytes.size}", initialProbe.response.headers["content-range"])
+        assertEquals("1024", initialProbe.response.headers["content-length"])
+        assertArrayEquals(bytes.copyOfRange(0, 1024), initialProbe.response.body)
+
+        val fromZero = serve(bytes, "GET", "bytes=0-")
+        assertEquals("OPEN_ENDED_RANGE", fromZero.result.requestKind)
+        assertEquals(206, fromZero.result.status)
+        assertEquals("bytes 0-${bytes.lastIndex}/${bytes.size}", fromZero.response.headers["content-range"])
+        assertEquals(bytes.size.toString(), fromZero.response.headers["content-length"])
+        assertArrayEquals(bytes, fromZero.response.body)
+
+        val openStart = bytes.size - 997
+        val open = serve(bytes, "GET", "bytes=$openStart-")
+        val openBody = bytes.copyOfRange(openStart, bytes.size)
+        assertEquals("OPEN_ENDED_RANGE", open.result.requestKind)
+        assertEquals(openStart.toLong(), open.result.requestedStartOffset)
+        assertNull(open.result.requestedEndOffset)
+        assertEquals(206, open.result.status)
+        assertEquals("bytes $openStart-${bytes.lastIndex}/${bytes.size}", open.response.headers["content-range"])
+        assertEquals(openBody.size.toString(), open.response.headers["content-length"])
+        assertEquals(openStart.toLong(), open.result.actualMediaStartOffset)
+        assertEquals(bytes.lastIndex.toLong(), open.result.actualMediaEndOffsetInclusive)
+        assertArrayEquals(openBody, open.response.body)
+
+        val headRangeOutput = ByteArrayOutputStream()
+        val headRange = TemporaryMkvPayload(bytes).use { source ->
             MediaHttpResponseWriter.serve(
-                output = BufferedOutputStream(openEndedResponseBytes),
-                method = "GET",
-                rangeHeader = "bytes=$openEndedStart-",
-                title = "S01E01.mkv",
+                output = BufferedOutputStream(headRangeOutput),
+                method = "HEAD",
+                rangeHeader = "bytes=10-19",
+                title = "Sakamoto Days E13.mkv",
                 reportedMimeType = "video/x-matroska",
                 media = source,
+                didlSize = bytes.size.toLong(),
             )
         }
-        val openEndedResponse = parseResponse(openEndedResponseBytes.toByteArray())
-        val expectedOpenEndedBytes = bytes.copyOfRange(openEndedStart, bytes.size)
-        assertEquals(206, openEndedResult.status)
-        assertEquals("bytes $openEndedStart-${bytes.lastIndex}/${bytes.size}", openEndedResponse.headers["content-range"])
-        assertEquals(expectedOpenEndedBytes.size.toString(), openEndedResponse.headers["content-length"])
-        assertEquals(openEndedStart.toLong(), openEndedMedia.lastSeekRelativeOffset)
-        assertArrayEquals(expectedOpenEndedBytes, openEndedResponse.body)
-
-        val mp4Title = "sample.mp4"
-        val mp4Node = nodeFor(mp4Title, bytes.size.toLong())
-            .copy(mimeType = UpnpXml.mediaMimeType(mp4Title, "application/octet-stream"))
-        val mp4Didl = UpnpXml.didlNode(mp4Node, "http://192.0.2.22:8200/media/mp4-token")
-        assertTrue(mp4Didl.contains("protocolInfo=\"http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\""))
-        val mp4Bytes = ByteArrayOutputStream()
-        TemporaryMkvPayload(bytes).use { source ->
-            MediaHttpResponseWriter.serve(
-                output = BufferedOutputStream(mp4Bytes),
-                method = "GET",
-                rangeHeader = null,
-                title = mp4Title,
-                reportedMimeType = "application/octet-stream",
-                media = source,
-            )
-        }
-        val mp4Response = parseResponse(mp4Bytes.toByteArray())
-        assertEquals("video/mp4", mp4Response.headers["content-type"])
-        assertArrayEquals(bytes, mp4Response.body)
+        val headRangeResponse = parseResponse(headRangeOutput.toByteArray())
+        assertEquals("BOUNDED_RANGE", headRange.requestKind)
+        assertEquals(206, headRange.status)
+        assertEquals("bytes 10-19/${bytes.size}", headRangeResponse.headers["content-range"])
+        assertEquals("10", headRangeResponse.headers["content-length"])
+        assertTrue(headRangeResponse.body.isEmpty())
+        assertEquals(0L, headRange.bytesWritten)
     }
 
     @Test
-    fun prematureSourceEofIsReportedAsAnIncompleteTransferInsteadOfSuccessfulShortPlayback() {
-        val actualBytes = sampleMkvBytes().copyOf(16_384)
-        val declaredLength = actualBytes.size + 257L
-        val responseBytes = ByteArrayOutputStream()
-        val result = TemporaryMkvPayload(actualBytes, declaredLength).use { source ->
+    fun arbitrarySeekOffsetsAlwaysReturnTheCorrespondingSourceSlice() {
+        val bytes = sampleMkvBytes()
+        val offsets = listOf(1, 31, 8_191, 131_077, bytes.lastIndex)
+        offsets.forEach { start ->
+            val end = (start + 73).coerceAtMost(bytes.lastIndex)
+            val transfer = serve(bytes, "GET", "bytes=$start-$end")
+            val expected = bytes.copyOfRange(start, end + 1)
+
+            assertEquals(start.toLong(), transfer.result.actualMediaStartOffset)
+            assertEquals(end.toLong(), transfer.result.actualMediaEndOffsetInclusive)
+            assertEquals((start + 5).toLong(), transfer.result.actualSourceStartOffset)
+            assertEquals((end + 5).toLong(), transfer.result.actualSourceEndOffsetInclusive)
+            assertEquals(expected.size.toLong(), transfer.result.bytesWritten)
+            assertArrayEquals(expected, transfer.response.body)
+        }
+    }
+
+    @Test
+    fun largeMkvSizedStreamCrossesMultipleBuffersWithoutLossOrTransformation() {
+        val bytes = sampleMkvBytes(12 * 1024 * 1024 + 257)
+        val output = ByteArrayOutputStream()
+        val result = TemporaryMkvPayload(bytes).use { source ->
             MediaHttpResponseWriter.serve(
-                output = BufferedOutputStream(responseBytes),
+                output = BufferedOutputStream(output, 128 * 1024),
                 method = "GET",
                 rangeHeader = null,
-                title = "S01E01.mkv",
+                title = "Sakamoto Days E13.mkv",
                 reportedMimeType = "video/x-matroska",
                 media = source,
+                didlSize = bytes.size.toLong(),
             )
         }
-        val response = parseResponse(responseBytes.toByteArray())
+        val response = parseResponse(output.toByteArray())
+
+        assertEquals(200, result.status)
+        assertEquals(bytes.size.toLong(), result.bytesRead)
+        assertEquals(bytes.size.toLong(), result.bytesWritten)
+        assertEquals(bytes.size.toString(), response.headers["content-length"])
+        assertTrue(result.complete)
+        assertArrayEquals(bytes, response.body)
+    }
+
+    @Test
+    fun didlAndOpenedFileSizeMismatchIsRejectedBeforeAnyMediaBytesAreSent() {
+        val bytes = sampleMkvBytes()
+        val output = ByteArrayOutputStream()
+        val result = TemporaryMkvPayload(bytes).use { source ->
+            MediaHttpResponseWriter.serve(
+                output = BufferedOutputStream(output),
+                method = "GET",
+                rangeHeader = null,
+                title = "Sakamoto Days E13.mkv",
+                reportedMimeType = "video/x-matroska",
+                media = source,
+                didlSize = bytes.size.toLong() + 1,
+            )
+        }
+        val response = parseResponse(output.toByteArray())
+
+        assertEquals(409, result.status)
+        assertTrue(result.complete)
+        assertEquals(0L, result.bytesRead)
+        assertEquals(response.body.size.toLong(), result.bytesWritten)
+        assertEquals(response.body.size.toString(), response.headers["content-length"])
+        assertFalse(response.headers.containsKey("transfer-encoding"))
+        assertTrue(result.error.orEmpty().contains("differs from DIDL size"))
+        assertTrue(response.body.isNotEmpty())
+        assertFalse(response.body.contentEquals(bytes))
+    }
+
+    @Test
+    fun descriptorStatSizeTooShortIsRejectedBeforeSendingAnOverlongContentLength() {
+        val bytes = sampleMkvBytes()
+        val expectedLength = bytes.size.toLong() + 1
+        val output = ByteArrayOutputStream()
+        val result = TemporaryMkvPayload(
+            payload = bytes,
+            length = expectedLength,
+            openedFileSize = expectedLength,
+            assetFileDescriptorLength = expectedLength,
+            descriptorStatSize = 5L + bytes.size,
+        ).use { source ->
+            MediaHttpResponseWriter.serve(
+                output = BufferedOutputStream(output),
+                method = "GET",
+                rangeHeader = null,
+                title = "Sakamoto Days E13.mkv",
+                reportedMimeType = "video/x-matroska",
+                media = source,
+                didlSize = expectedLength,
+            )
+        }
+        val response = parseResponse(output.toByteArray())
+
+        assertEquals(409, result.status)
+        assertEquals(0L, result.bytesRead)
+        assertFalse(response.headers.containsKey("transfer-encoding"))
+        assertEquals(response.body.size.toString(), response.headers["content-length"])
+        assertTrue(result.error.orEmpty().contains("descriptor stat size"))
+        assertFalse(response.body.contentEquals(bytes))
+    }
+
+    @Test
+    fun unknownLengthNeverFallsBackToChunkedMediaResponse() {
+        val output = ByteArrayOutputStream()
+        val result = TemporaryMkvPayload(
+            sampleMkvBytes(),
+            length = -1,
+            openedFileSize = null,
+            assetFileDescriptorLength = null,
+            descriptorStatSize = null,
+        ).use { source ->
+            MediaHttpResponseWriter.serve(
+                output = BufferedOutputStream(output),
+                method = "GET",
+                rangeHeader = null,
+                title = "unknown.mkv",
+                reportedMimeType = "video/x-matroska",
+                media = source,
+                didlSize = null,
+            )
+        }
+        val response = parseResponse(output.toByteArray())
+
+        assertEquals(503, result.status)
+        assertTrue(response.headers.containsKey("content-length"))
+        assertFalse(response.headers.containsKey("transfer-encoding"))
+        assertEquals(0L, result.bytesRead)
+        assertTrue(result.complete)
+    }
+
+    @Test
+    fun earlyEofIsDetectedAndNeverMarkedAsACompleteTransfer() {
+        val actualBytes = sampleMkvBytes().copyOf(16_384)
+        val declaredLength = actualBytes.size + 257L
+        val output = ByteArrayOutputStream()
+        val result = TemporaryMkvPayload(
+            payload = actualBytes,
+            length = declaredLength,
+            openedFileSize = declaredLength,
+            assetFileDescriptorLength = declaredLength,
+            descriptorStatSize = null,
+        ).use { source ->
+            MediaHttpResponseWriter.serve(
+                output = BufferedOutputStream(output),
+                method = "GET",
+                rangeHeader = null,
+                title = "Sakamoto Days E13.mkv",
+                reportedMimeType = "video/x-matroska",
+                media = source,
+                didlSize = declaredLength,
+            )
+        }
+        val response = parseResponse(output.toByteArray())
 
         assertEquals(200, result.status)
         assertEquals(declaredLength.toString(), response.headers["content-length"])
-        assertEquals(actualBytes.size.toLong(), result.bytesServed)
+        assertEquals(actualBytes.size.toLong(), result.bytesRead)
+        assertEquals(actualBytes.size.toLong(), result.bytesWritten)
+        assertTrue(result.eofReached)
+        assertTrue(result.prematureEof)
         assertFalse(result.complete)
         assertTrue(result.error.orEmpty().contains("ended early"))
+        assertTrue(response.body.size < response.headers.getValue("content-length").toInt())
         assertArrayEquals(actualBytes, response.body)
     }
 
     @Test
-    fun invalidRangeIsNeverServedAsAFullFileAndHeadDoesNotSendABody() {
+    fun invalidRangeIsNeverServedAsAFullFile() {
         val bytes = sampleMkvBytes()
-        val invalidBytes = ByteArrayOutputStream()
-        val invalidResult = TemporaryMkvPayload(bytes).use { source ->
+        val output = ByteArrayOutputStream()
+        val result = TemporaryMkvPayload(bytes).use { source ->
             MediaHttpResponseWriter.serve(
-                output = BufferedOutputStream(invalidBytes),
+                output = BufferedOutputStream(output),
                 method = "GET",
                 rangeHeader = "bytes=${bytes.size + 9}-",
-                title = "S01E01.mkv",
+                title = "Sakamoto Days E13.mkv",
                 reportedMimeType = "video/x-matroska",
                 media = source,
+                didlSize = bytes.size.toLong(),
             )
         }
-        val invalidResponse = parseResponse(invalidBytes.toByteArray())
-        assertEquals(416, invalidResult.status)
-        assertEquals("bytes */${bytes.size}", invalidResponse.headers["content-range"])
-        assertEquals(0L, invalidResult.bytesServed)
-        assertTrue(invalidResult.complete)
-        assertFalse(invalidResponse.body.contentEquals(bytes))
+        val response = parseResponse(output.toByteArray())
 
-        val headBytes = ByteArrayOutputStream()
-        val headResult = TemporaryMkvPayload(bytes).use { source ->
-            MediaHttpResponseWriter.serve(
-                output = BufferedOutputStream(headBytes),
-                method = "HEAD",
-                rangeHeader = "bytes=10-19",
-                title = "S01E01.mkv",
-                reportedMimeType = null,
-                media = source,
-            )
-        }
-        val headResponse = parseResponse(headBytes.toByteArray())
-        assertEquals(206, headResult.status)
-        assertEquals("bytes 10-19/${bytes.size}", headResponse.headers["content-range"])
-        assertEquals("10", headResponse.headers["content-length"])
-        assertTrue(headResponse.body.isEmpty())
-        assertEquals(0L, headResult.bytesServed)
-        assertTrue(headResult.complete)
+        assertEquals("OPEN_ENDED_RANGE", result.requestKind)
+        assertEquals(416, result.status)
+        assertEquals("bytes */${bytes.size}", response.headers["content-range"])
+        assertEquals("close", response.headers["connection"])
+        assertFalse(response.headers.containsKey("transfer-encoding"))
+        assertTrue(result.complete)
+        assertFalse(response.body.contentEquals(bytes))
     }
 
-    private fun nodeFor(title: String, size: Long) = MediaNode(
-        objectId = "i:token",
-        parentId = "d:season1",
-        documentId = title,
-        title = title,
-        isContainer = false,
-        mimeType = "application/octet-stream",
-        size = size,
-        modifiedMillis = 0,
-    )
+    private fun serve(bytes: ByteArray, method: String, range: String): TransferAndResponse {
+        val output = ByteArrayOutputStream()
+        val result = TemporaryMkvPayload(bytes).use { source ->
+            MediaHttpResponseWriter.serve(
+                output = BufferedOutputStream(output),
+                method = method,
+                rangeHeader = range,
+                title = "Sakamoto Days E13.mkv",
+                reportedMimeType = "video/x-matroska",
+                media = source,
+                didlSize = bytes.size.toLong(),
+            )
+        }
+        return TransferAndResponse(result, parseResponse(output.toByteArray()))
+    }
 
-    private fun sampleMkvBytes(): ByteArray = ByteArray(256 * 1024 + 37) { index ->
+    private fun sampleMkvBytes(size: Int = 256 * 1024 + 37): ByteArray = ByteArray(size) { index ->
         ((index * 31 + index / 251) and 0xff).toByte()
     }.apply {
-        // Matroska/EBML document signature; the remaining deterministic binary fixture lets the
-        // test detect any byte loss, offset error, text conversion, or other transformation.
+        // Matroska/EBML document signature plus deterministic binary payload for exact-byte checks.
         this[0] = 0x1a.toByte()
         this[1] = 0x45.toByte()
         this[2] = 0xdf.toByte()
@@ -271,6 +439,11 @@ class MediaHttpResponseWriterTest {
         )
     }
 
+    private data class TransferAndResponse(
+        val result: MediaHttpTransferResult,
+        val response: ParsedResponse,
+    )
+
     private data class ParsedResponse(
         val statusLine: String,
         val headers: Map<String, String>,
@@ -280,6 +453,9 @@ class MediaHttpResponseWriterTest {
     private class TemporaryMkvPayload(
         payload: ByteArray,
         override val length: Long = payload.size.toLong(),
+        override val openedFileSize: Long? = payload.size.toLong(),
+        override val assetFileDescriptorLength: Long? = openedFileSize,
+        override val descriptorStatSize: Long? = 5L + payload.size,
     ) : MediaPayload {
         private val file: File = Files.createTempFile("m36-mkv-range-test", ".mkv").toFile()
         private val assetPrefix = byteArrayOf(0x51, 0x22, 0x7f, 0x11, 0x03)

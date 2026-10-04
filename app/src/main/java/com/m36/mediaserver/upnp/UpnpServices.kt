@@ -294,7 +294,7 @@ class ContentDirectoryService(
                 sorted.subList(from, to)
             }
             val normalizedBase = baseUrl.trimEnd('/')
-            val didlNodes = page.joinToString("") { node ->
+            val emittedItems = page.map { node ->
                 val resource = if (node.isContainer) null else {
                     val token = node.mediaToken?.takeIf { it.isNotBlank() }
                         ?: throw UpnpFault(720, "Media item has no HTTP token: ${node.objectId}")
@@ -303,16 +303,30 @@ class ContentDirectoryService(
                 val outputNode = if (node.isContainer) node else node.copy(
                     mimeType = UpnpXml.mediaMimeType(node.title, node.mimeType),
                 )
-                UpnpXml.didlNode(outputNode, resource)
+                node to UpnpXml.didlNode(outputNode, resource)
             }
+            val didlNodes = emittedItems.joinToString("") { it.second }
             val didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
                 "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
                 "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" " +
                 "xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\">$didlNodes</DIDL-Lite>"
             val updateId = repository.systemUpdateId
+            val browseResult = buildString {
+                append("NumberReturned=${page.size} | TotalMatches=$total | UpdateID=$updateId")
+                val mediaItems = emittedItems.filter { !it.first.isContainer }
+                if (mediaItems.isNotEmpty()) {
+                    appendLine()
+                    appendLine("DIDL-Lite media resource metadata (exact emitted item fragments):")
+                    mediaItems.forEach { (node, fragment) ->
+                        appendLine("ObjectID=${node.objectId} | title=${node.title}")
+                        appendLine("  ${didlResourceSummary(fragment)}")
+                        appendLine("  Exact DIDL item: $fragment")
+                    }
+                }
+            }
             onBrowseTrace(
                 requestTrace,
-                "NumberReturned=${page.size} | TotalMatches=$total | UpdateID=$updateId",
+                browseResult,
                 repository.lastEnumerationDiagnostics,
             )
             return listOf(
@@ -330,6 +344,41 @@ class ContentDirectoryService(
             onBrowseTrace(requestTrace, description, repository.lastEnumerationDiagnostics)
             if (error is UpnpFault) throw error
             throw UpnpFault(501, "Browse failed")
+        }
+    }
+
+    /** Summarize fields parsed from the exact DIDL item fragment emitted to the SOAP Result. */
+    private fun didlResourceSummary(fragment: String): String {
+        val resourceTag = Regex("<res\\b([^>]*)>").find(fragment)
+            ?: return "No <res> resource element emitted"
+        val attributes = Regex("([A-Za-z_:][A-Za-z0-9_.:-]*)=\"([^\"]*)\"")
+            .findAll(resourceTag.groupValues[1])
+            .associate { it.groupValues[1] to it.groupValues[2] }
+        val protocolInfo = attributes["protocolInfo"]
+        val itemClass = Regex("<upnp:class>([^<]*)</upnp:class>").find(fragment)?.groupValues?.get(1)
+        val protocolParts = protocolInfo?.split(':', limit = 4).orEmpty()
+        val dlnaParameters = protocolParts.getOrNull(3)
+            ?.split(';')
+            ?.mapNotNull { parameter ->
+                val pair = parameter.split('=', limit = 2)
+                pair.takeIf { it.size == 2 }?.let { it[0] to it[1] }
+            }
+            ?.toMap()
+            .orEmpty()
+        val contentStart = resourceTag.range.last + 1
+        val contentEnd = fragment.indexOf("</res>", contentStart)
+        val resourceUrl = if (contentEnd >= contentStart) fragment.substring(contentStart, contentEnd) else "(not present)"
+        return buildString {
+            append("UPnP class=${itemClass ?: "(not present)"}")
+            append(" | protocolInfo=${protocolInfo ?: "(not present)"}")
+            append(" | MIME=${protocolParts.getOrNull(2) ?: "(not present)"}")
+            append(" | size=${attributes["size"] ?: "(not present)"}")
+            append(" | duration=${attributes["duration"] ?: "(not present)"}")
+            append(" | DLNA.ORG_OP=${dlnaParameters["DLNA.ORG_OP"] ?: "(not present)"}")
+            append(" | DLNA.ORG_CI=${dlnaParameters["DLNA.ORG_CI"] ?: "(not present)"}")
+            append(" | DLNA.ORG_FLAGS=${dlnaParameters["DLNA.ORG_FLAGS"] ?: "(not present)"}")
+            append(" | DLNA.ORG_PN=${dlnaParameters["DLNA.ORG_PN"] ?: "(not present)"}")
+            append(" | resource URL=$resourceUrl")
         }
     }
 

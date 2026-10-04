@@ -1,6 +1,7 @@
 package com.m36.mediaserver.data
 
 import java.util.ArrayDeque
+import java.util.TreeMap
 import java.util.concurrent.atomic.AtomicLong
 
 class ServerMetrics {
@@ -13,6 +14,7 @@ class ServerMetrics {
 
     @Volatile var lastSsdpRequest: String = "—"
     @Volatile var lastHttpRequest: String = "—"
+    @Volatile var firstMediaHttpExchange: String = "—"
     @Volatile var lastMediaHttpExchange: String = "—"
     @Volatile var lastRootDescriptionGet: String = "—"
     @Volatile var lastContentDirectoryScpdGet: String = "—"
@@ -41,51 +43,38 @@ class ServerMetrics {
     @Volatile var serverStatus: String = "Stopped"
 
     private val contentDirectorySoapHistory = ArrayDeque<String>()
-    private val mediaHttpHistory = ArrayDeque<String>()
+    private val mediaHttpSequence = AtomicLong(0)
+    private val mediaHttpHistory = TreeMap<Long, String>()
+    private var firstMediaSequence = Long.MAX_VALUE
+    private var lastRecordedMediaSequence = 0L
+
+    fun nextMediaHttpSequence(): Long = mediaHttpSequence.incrementAndGet()
 
     @Synchronized
-    fun recordMediaHttpExchange(
-        clientAddress: String,
-        resourcePath: String,
-        resourceId: String,
-        resourceName: String?,
-        method: String,
-        rangeHeader: String?,
-        responseStatus: Int,
-        responseReason: String,
-        contentType: String?,
-        contentLength: Long?,
-        contentRange: String?,
-        acceptRanges: String?,
-        byteOffset: Long?,
-        sourceByteOffset: Long?,
-        bytesServed: Long,
-        complete: Boolean,
-        detail: String?,
-    ) {
-        val transaction = buildString {
-            appendLine("$method $resourcePath (resource ID=$resourceId)")
-            appendLine("Client address: $clientAddress")
-            appendLine("Media title: ${resourceName ?: "(unknown)"}")
-            appendLine("Range: ${rangeHeader?.takeIf { it.isNotBlank() } ?: "(none)"}")
-            appendLine("Response: $responseStatus $responseReason")
-            appendLine("Content-Type: ${contentType ?: "(not set)"}")
-            appendLine("Content-Length: ${contentLength?.toString() ?: "(not set)"}")
-            appendLine("Content-Range: ${contentRange ?: "(not set)"}")
-            appendLine("Accept-Ranges: ${acceptRanges ?: "(not set)"}")
-            appendLine("Actual media byte offset: ${byteOffset?.toString() ?: "(not reached/unknown)"}")
-            appendLine("Actual underlying source byte offset: ${sourceByteOffset?.toString() ?: "(not reached/unknown)"}")
-            appendLine("Media bytes served: $bytesServed")
-            appendLine("Transfer complete: $complete")
-            detail?.takeIf { it.isNotBlank() }?.let { appendLine("Transfer detail: $it") }
-        }.trimEnd()
-        lastMediaHttpExchange = transaction
-        if (mediaHttpHistory.size >= MAX_MEDIA_HTTP_HISTORY) mediaHttpHistory.removeFirst()
-        mediaHttpHistory.addLast(transaction)
+    fun recordMediaHttpExchange(exchange: MediaHttpExchange) {
+        val transaction = exchange.format()
+        if (exchange.sequence < firstMediaSequence) {
+            firstMediaSequence = exchange.sequence
+            firstMediaHttpExchange = transaction
+        }
+        if (exchange.sequence >= lastRecordedMediaSequence) {
+            lastRecordedMediaSequence = exchange.sequence
+            lastMediaHttpExchange = transaction
+        }
+
+        // Keep the newest requests by arrival order rather than response completion order. A slow
+        // transfer can finish after later seeks; it must not make the visible playback sequence lie.
+        val firstSequenceToKeep = (mediaHttpSequence.get() - MAX_MEDIA_HTTP_HISTORY + 1).coerceAtLeast(1)
+        if (exchange.sequence >= firstSequenceToKeep) {
+            mediaHttpHistory[exchange.sequence] = transaction
+            while (mediaHttpHistory.size > MAX_MEDIA_HTTP_HISTORY) {
+                mediaHttpHistory.pollFirstEntry()
+            }
+        }
     }
 
     @Synchronized
-    fun mediaHttpHistorySnapshot(): List<String> = mediaHttpHistory.toList()
+    fun mediaHttpHistorySnapshot(): List<String> = mediaHttpHistory.values.toList()
 
     @Synchronized
     fun recordContentDirectorySoapTransaction(
@@ -137,6 +126,6 @@ class ServerMetrics {
     private companion object {
         const val MAX_DIAGNOSTIC_HISTORY = 8
         const val MAX_DIAGNOSTIC_BODY_CHARS = 2_048
-        const val MAX_MEDIA_HTTP_HISTORY = 8
+        const val MAX_MEDIA_HTTP_HISTORY = 64
     }
 }

@@ -1,6 +1,7 @@
 package com.m36.mediaserver.http
 
 import android.content.Context
+import com.m36.mediaserver.data.MediaHttpExchange
 import com.m36.mediaserver.data.ServerMetrics
 import com.m36.mediaserver.media.DocumentTreeRepository
 import com.m36.mediaserver.network.NetworkSnapshot
@@ -362,92 +363,100 @@ class LocalHttpServer(
         headOnly: Boolean,
         clientAddress: String,
     ) {
+        val sequence = metrics.nextMediaHttpSequence()
+        val node = repository.metadataNodeForToken(token)
         val rangeHeader = request.headers["range"]
+        var effectiveMediaLength: Long? = null
+        var safOpenedFileSize: Long? = null
+        var safAssetLength: Long? = null
+        var safDescriptorStatSize: Long? = null
+        val method = if (headOnly) "HEAD" else request.method
+
         val result = if (token.isBlank() || token.contains('/') || token.contains("..")) {
-            writeMediaNotFound(output, headOnly, error = "Invalid media resource ID")
+            MediaHttpResponseWriter.writeErrorResponse(
+                output = output,
+                status = 404,
+                reason = "Not Found",
+                message = "Media not found",
+                method = method,
+                rangeHeader = rangeHeader,
+                error = "Invalid media resource ID",
+            )
         } else {
             val openAttempt = runCatching { repository.openMedia(token) }
-            val opened = openAttempt.getOrNull()
-            if (opened == null) {
+            val media = openAttempt.getOrNull()
+            if (media == null) {
                 val cause = openAttempt.exceptionOrNull()?.let { ": ${it.message ?: it.javaClass.simpleName}" }.orEmpty()
-                writeMediaNotFound(output, headOnly, error = "SAF media resource could not be opened$cause")
+                MediaHttpResponseWriter.writeErrorResponse(
+                    output = output,
+                    status = 404,
+                    reason = "Not Found",
+                    message = "Media not found",
+                    method = method,
+                    rangeHeader = rangeHeader,
+                    error = "SAF media resource could not be opened$cause",
+                )
             } else {
-                opened.use { media ->
-                    val node = repository.metadataNodeForToken(token)
-                    val transfer = MediaHttpResponseWriter.serve(
+                media.use { opened ->
+                    effectiveMediaLength = opened.length.takeIf { it >= 0 }
+                    safOpenedFileSize = opened.openedFileSize?.takeIf { it >= 0 }
+                    safAssetLength = opened.assetFileDescriptorLength?.takeIf { it >= 0 }
+                    safDescriptorStatSize = opened.descriptorStatSize?.takeIf { it >= 0 }
+                    MediaHttpResponseWriter.serve(
                         output = output,
-                        method = if (headOnly) "HEAD" else request.method,
+                        method = method,
                         rangeHeader = rangeHeader,
                         title = node?.title ?: "media.bin",
                         reportedMimeType = node?.mimeType,
-                        media = media,
+                        media = opened,
+                        didlSize = node?.size,
                     )
-                    val listedSize = node?.size?.takeIf { it >= 0 }
-                    if (listedSize != null && media.length >= 0 && listedSize != media.length) {
-                        transfer.copy(
-                            error = listOfNotNull(
-                                transfer.error,
-                                "SAF-listed size=$listedSize differs from opened media length=${media.length}",
-                            ).joinToString("; "),
-                        )
-                    } else transfer
                 }
             }
         }
-        metrics.recordMediaHttpExchange(
-            clientAddress = clientAddress,
-            resourcePath = request.path,
-            resourceId = token,
-            resourceName = repository.metadataNodeForToken(token)?.title,
-            method = request.method,
-            rangeHeader = rangeHeader,
-            responseStatus = result.status,
-            responseReason = result.reason,
-            contentType = result.contentType,
-            contentLength = result.contentLength,
-            contentRange = result.contentRange,
-            acceptRanges = result.acceptRanges,
-            byteOffset = result.byteOffset,
-            sourceByteOffset = result.sourceByteOffset,
-            bytesServed = result.bytesServed,
-            complete = result.complete,
-            detail = result.error,
-        )
-    }
 
-    private fun writeMediaNotFound(
-        output: BufferedOutputStream,
-        headOnly: Boolean,
-        error: String,
-    ): MediaHttpTransferResult {
-        val message = "Media not found"
-        val body = message.toByteArray(StandardCharsets.UTF_8)
-        val contentType = "text/plain; charset=utf-8"
-        writeHead(
-            output,
-            404,
-            "Not Found",
-            listOf(
-                "Content-Type: $contentType",
-                "Content-Length: ${body.size}",
-                "Connection: close",
-                "Server: M36MediaServer/1.0",
+        metrics.recordMediaHttpExchange(
+            MediaHttpExchange(
+                sequence = sequence,
+                clientIp = clientAddress,
+                method = request.rawMethod,
+                requestTarget = request.target,
+                resourcePath = request.path,
+                mediaId = token,
+                objectId = node?.objectId,
+                mediaTitle = node?.title,
+                userAgentHeader = request.rawHeaderLines("user-agent").joinToString("\n").ifEmpty { null },
+                rangeHeader = request.rawHeaderLines("range").joinToString("\n").ifEmpty { null },
+                requestConnectionHeaders = request.rawHeaderLines("connection"),
+                requestTransferEncodingHeaders = request.rawHeaderLines("transfer-encoding"),
+                requestKind = result.requestKind,
+                requestedStartOffset = result.requestedStartOffset,
+                requestedEndOffset = result.requestedEndOffset,
+                requestedSuffixLength = result.requestedSuffixLength,
+                responseStatus = result.status,
+                responseReason = result.reason,
+                responseContentType = result.contentType,
+                responseContentLength = result.contentLength,
+                responseContentRange = result.contentRange,
+                responseAcceptRanges = result.acceptRanges,
+                responseConnection = result.responseConnection,
+                responseTransferEncoding = result.responseTransferEncoding,
+                effectiveMediaLength = effectiveMediaLength,
+                safOpenedFileSize = safOpenedFileSize,
+                safAssetFileDescriptorLength = safAssetLength,
+                safDescriptorStatSize = safDescriptorStatSize,
+                didlRequestedSize = node?.size?.takeIf { it >= 0 },
+                actualMediaStartOffset = result.actualMediaStartOffset,
+                actualMediaEndOffsetInclusive = result.actualMediaEndOffsetInclusive,
+                actualSourceStartOffset = result.actualSourceStartOffset,
+                actualSourceEndOffsetInclusive = result.actualSourceEndOffsetInclusive,
+                bytesReadFromSaf = result.bytesRead,
+                bytesWrittenToResponse = result.bytesWritten,
+                complete = result.complete,
+                eofReached = result.eofReached,
+                prematureEof = result.prematureEof,
+                error = result.error,
             ),
-        )
-        if (!headOnly) output.write(body)
-        output.flush()
-        return MediaHttpTransferResult(
-            status = 404,
-            reason = "Not Found",
-            contentType = contentType,
-            contentLength = body.size.toLong(),
-            contentRange = null,
-            acceptRanges = null,
-            byteOffset = null,
-            sourceByteOffset = null,
-            bytesServed = 0,
-            complete = true,
-            error = error,
         )
     }
 
@@ -478,17 +487,20 @@ class LocalHttpServer(
         if (requestLine.isBlank()) return null
         val requestParts = requestLine.trim().split(Regex("\\s+"), limit = 3)
         if (requestParts.size < 2) throw IOException("Malformed HTTP request line")
-        val method = requestParts[0].uppercase(Locale.ROOT)
+        val rawMethod = requestParts[0]
+        val method = rawMethod.uppercase(Locale.ROOT)
         val rawTarget = requestParts[1]
         val path = normalizePath(rawTarget)
         val headers = LinkedHashMap<String, String>()
         val rawHeaders = LinkedHashMap<String, String>()
+        val headerLines = ArrayList<String>()
         var consumedBytes = requestLine.length
         while (true) {
             val line = readAsciiLine(input, MAX_HEADER_BYTES) ?: throw IOException("Truncated HTTP headers")
             consumedBytes += line.length + 2
             if (consumedBytes > MAX_HEADER_BYTES) throw RequestTooLargeException()
             if (line.isEmpty()) break
+            headerLines += line
             val colon = line.indexOf(':')
             if (colon <= 0) continue
             val name = line.substring(0, colon).trim().lowercase(Locale.ROOT)
@@ -505,7 +517,7 @@ class LocalHttpServer(
         if (contentLength > MAX_REQUEST_BODY_BYTES) throw RequestTooLargeException()
         val body = ByteArray(contentLength.toInt())
         if (body.isNotEmpty()) DataInputStream(input).readFully(body)
-        return HttpRequest(method, rawTarget, path, headers, rawHeaders, body)
+        return HttpRequest(method, rawMethod, rawTarget, path, headers, rawHeaders, headerLines, body)
     }
 
     private fun normalizePath(target: String): String {
@@ -569,12 +581,18 @@ class LocalHttpServer(
 
     private data class HttpRequest(
         val method: String,
+        val rawMethod: String,
         val target: String,
         val path: String,
         val headers: Map<String, String>,
         val rawHeaders: Map<String, String>,
+        val headerLines: List<String>,
         val body: ByteArray,
-    )
+    ) {
+        fun rawHeaderLines(name: String): List<String> = headerLines.filter { line ->
+            line.substringBefore(':').trim().equals(name, ignoreCase = true)
+        }
+    }
 
     private class RequestTooLargeException : IOException("Request exceeded configured size limit")
 

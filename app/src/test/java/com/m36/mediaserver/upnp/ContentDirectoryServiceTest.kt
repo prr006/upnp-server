@@ -204,6 +204,12 @@ class ContentDirectoryServiceTest {
         assertTrue(traces.last().first.contains("StartingIndex=1"))
         assertTrue(traces.last().second.contains("NumberReturned=1"))
         assertTrue(traces.last().second.contains("TotalMatches=22"))
+        assertTrue(traces.last().second.contains("DIDL-Lite media resource metadata"))
+        assertTrue(traces.last().second.contains("protocolInfo=http-get:*:video/x-matroska:DLNA.ORG_OP=01"))
+        assertTrue(traces.last().second.contains("MIME=video/x-matroska"))
+        assertTrue(traces.last().second.contains("duration=(not present)"))
+        assertTrue(traces.last().second.contains("DLNA.ORG_PN=(not present)"))
+        assertTrue(traces.last().second.contains("resource URL=http://10.221.18.195:8200/media/e02"))
         assertTrue(traces.last().third.contains("SAF enumerated"))
     }
 

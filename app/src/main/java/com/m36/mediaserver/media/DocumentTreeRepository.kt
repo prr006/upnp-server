@@ -39,6 +39,9 @@ class OpenedMedia internal constructor(
     override val stream: FileInputStream,
     override val length: Long,
     override val startOffset: Long,
+    override val openedFileSize: Long?,
+    override val assetFileDescriptorLength: Long?,
+    override val descriptorStatSize: Long?,
 ) : MediaPayload {
     @Throws(IOException::class)
     override fun seek(relativePosition: Long) {
@@ -173,13 +176,21 @@ class DocumentTreeRepository(context: Context, val treeUri: Uri) : MediaCatalog 
             val descriptor = asset.parcelFileDescriptor
             val stream = FileInputStream(descriptor.fileDescriptor)
             val startOffset = asset.startOffset
-            val length = when {
-                asset.length >= 0 -> asset.length
-                descriptor.statSize >= startOffset -> descriptor.statSize - startOffset
-                node.size >= 0 -> node.size
-                else -> -1L
-            }
-            return OpenedMedia(asset, stream, length, startOffset)
+            val descriptorStatSize = descriptor.statSize.takeIf { it >= 0 }
+            val assetLength = asset.length.takeIf { it >= 0 }
+            val openedFileSize = assetLength ?: descriptorStatSize
+                ?.takeIf { it >= startOffset }
+                ?.minus(startOffset)
+            val length = openedFileSize ?: node.size.takeIf { it >= 0 } ?: -1L
+            return OpenedMedia(
+                descriptor = asset,
+                stream = stream,
+                length = length,
+                startOffset = startOffset,
+                openedFileSize = openedFileSize,
+                assetFileDescriptorLength = assetLength,
+                descriptorStatSize = descriptorStatSize,
+            )
         } catch (error: Exception) {
             runCatching { asset.close() }
             throw if (error is IOException) error else IOException("Unable to open media descriptor", error)

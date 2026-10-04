@@ -119,6 +119,7 @@ class MediaServerEngine(
             ssdpResponsesSent = metrics.ssdpResponsesSent.get(),
             httpRequestCount = metrics.httpRequestCount.get(),
             lastHttpRequest = metrics.lastHttpRequest,
+            firstMediaHttpExchange = metrics.firstMediaHttpExchange,
             lastMediaHttpExchange = metrics.lastMediaHttpExchange,
             mediaHttpHistory = metrics.mediaHttpHistorySnapshot(),
             rootDescriptionGetCount = metrics.rootDescriptionGetCount.get(),

@@ -253,17 +253,22 @@ class MainActivity : Activity() {
             appendLine("SSDP responses sent: ${diagnostics.ssdpResponsesSent}")
             appendLine("HTTP request count: ${diagnostics.httpRequestCount}")
             appendLine("Last HTTP request: ${diagnostics.lastHttpRequest}")
-            appendLine("Last media HTTP exchange:")
+            appendLine("Media playback diagnosis:")
+            appendLine("First media request observed:")
+            appendLine(diagnostics.firstMediaHttpExchange)
+            appendLine("Most recent completed media request:")
             appendLine(diagnostics.lastMediaHttpExchange)
-            appendLine("Recent media HTTP exchanges (up to 8):")
+            appendLine("Recent media request sequence (arrival order; up to 64):")
             if (diagnostics.mediaHttpHistory.isEmpty()) {
-                appendLine("  (none)")
+                appendLine("  (no media requests yet)")
             } else {
-                diagnostics.mediaHttpHistory.forEachIndexed { index, transaction ->
-                    appendLine("--- Media request ${index + 1} ---")
+                diagnostics.mediaHttpHistory.forEach { transaction ->
                     appendLine(transaction)
+                    appendLine()
                 }
             }
+            appendLine("DIDL-Lite media metadata from the last Browse:")
+            appendLine(diagnostics.lastContentDirectoryBrowseResult)
             appendLine("GET /rootDesc.xml count: ${diagnostics.rootDescriptionGetCount}")
             appendLine("Last rootDesc.xml GET: ${diagnostics.lastRootDescriptionGet}")
             appendLine("GET ContentDirectory SCPD count: ${diagnostics.contentDirectoryScpdGetCount}")
@@ -293,7 +298,6 @@ class MainActivity : Activity() {
             appendLine("Advertised ContentDirectory controlURL: ${diagnostics.advertisedContentDirectoryControlUrl}")
             appendLine("Advertised ContentDirectory eventSubURL: ${diagnostics.advertisedContentDirectoryEventSubUrl}")
             appendLine("ContentDirectory Browse request: ${diagnostics.lastContentDirectoryBrowseRequest}")
-            appendLine("ContentDirectory result: ${diagnostics.lastContentDirectoryBrowseResult}")
             appendLine("Last SAF traversal: ${diagnostics.lastSafEnumeration}")
             append("Selected shared folder: ${diagnostics.selectedFolder.takeIf { it != "Not selected" } ?: selectedFolderName}")
         }
