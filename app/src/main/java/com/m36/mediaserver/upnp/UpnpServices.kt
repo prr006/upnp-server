@@ -3,10 +3,8 @@ package com.m36.mediaserver.upnp
 import com.m36.mediaserver.media.MediaCatalog
 import com.m36.mediaserver.media.MediaNode
 import java.io.StringReader
-import javax.xml.XMLConstants
-import javax.xml.parsers.DocumentBuilderFactory
-import org.w3c.dom.Element
-import org.xml.sax.InputSource
+import org.kxml2.io.KXmlParser
+import org.xmlpull.v1.XmlPullParser
 
 class UpnpFault(val errorCode: Int, override val message: String) : Exception(message)
 
@@ -37,46 +35,114 @@ object SoapXml {
     private const val SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
     private const val CONTENT_DIRECTORY_NS = "urn:schemas-upnp-org:service:ContentDirectory:1"
     private const val CONNECTION_MANAGER_NS = "urn:schemas-upnp-org:service:ConnectionManager:1"
+    private val FORBIDDEN_XML_DECLARATION = Regex("<!\\s*(?:DOCTYPE|ENTITY)\\b", RegexOption.IGNORE_CASE)
 
     /** Parse by XML namespace URI and local names, never by the sender's chosen prefixes. */
     fun parseAction(xml: String): SoapActionRequest {
+        val normalizedXml = xml.removePrefix("\uFEFF")
+        if (normalizedXml.isBlank()) throw UpnpFault(402, "Invalid Args: empty SOAP body")
+        if (FORBIDDEN_XML_DECLARATION.containsMatchIn(normalizedXml)) {
+            throw UpnpFault(402, "Invalid Args: DTD and entity declarations are not allowed")
+        }
+
         try {
-            val normalizedXml = xml.removePrefix("\uFEFF")
-            if (normalizedXml.isBlank()) throw UpnpFault(402, "Invalid Args: empty SOAP body")
-            val factory = DocumentBuilderFactory.newInstance().apply {
-                isNamespaceAware = true
-                // Android's built-in DOM parser throws UnsupportedOperationException from
-                // setXIncludeAware(), even when setting false. XInclude is disabled by default.
-                setExpandEntityReferences(false)
-                setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
-                setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
-                setFeature("http://xml.org/sax/features/external-general-entities", false)
-                setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+            // Use the same namespace-aware pull parser on Android and in JVM unit tests. No JAXP
+            // FEATURE_SECURE_PROCESSING or provider-specific parser features are required.
+            val parser = KXmlParser().apply {
+                setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
+                setInput(StringReader(normalizedXml))
             }
-            val document = factory.newDocumentBuilder().parse(InputSource(StringReader(normalizedXml)))
-            val envelope = document.documentElement
-                ?: throw UpnpFault(402, "Invalid Args: SOAP Envelope missing")
-            if (localName(envelope) != "Envelope" || envelope.namespaceURI != SOAP_NS) {
-                throw UpnpFault(402, "Invalid Args: SOAP 1.1 Envelope namespace missing")
-            }
-            val body = childElements(envelope).firstOrNull {
-                localName(it) == "Body" && it.namespaceURI == envelope.namespaceURI
-            } ?: throw UpnpFault(402, "Invalid Args: SOAP Body missing")
-            val action = childElements(body).firstOrNull()
-                ?: throw UpnpFault(401, "SOAP action missing")
-            val actionName = localName(action).trim()
-            if (actionName.isEmpty()) throw UpnpFault(401, "SOAP action name missing")
-            val actionNamespace = action.namespaceURI.orEmpty()
+            var envelopeNamespace: String? = null
+            var bodyDepth: Int? = null
+            var actionDepth: Int? = null
+            var actionClosed = false
+            var actionName: String? = null
+            var actionNamespace = ""
             val arguments = LinkedHashMap<String, String>()
-            for (element in childElements(action)) {
-                val name = localName(element).trim()
-                if (name.isNotEmpty()) arguments[name] = element.textContent.orEmpty().trim()
+            var argumentDepth: Int? = null
+            var argumentName: String? = null
+            val argumentText = StringBuilder()
+
+            var event = parser.eventType
+            while (event != XmlPullParser.END_DOCUMENT) {
+                when (event) {
+                    XmlPullParser.START_TAG -> {
+                        val depth = parser.depth
+                        val name = parser.name.orEmpty()
+                        val namespace = parser.namespace.orEmpty()
+                        val currentBodyDepth = bodyDepth
+                        val currentActionDepth = actionDepth
+                        val currentArgumentDepth = argumentDepth
+                        when {
+                            depth == 1 && envelopeNamespace == null -> {
+                                if (name != "Envelope" || namespace != SOAP_NS) {
+                                    throw UpnpFault(402, "Invalid Args: SOAP 1.1 Envelope namespace missing")
+                                }
+                                envelopeNamespace = namespace
+                            }
+                            envelopeNamespace == null ->
+                                throw UpnpFault(402, "Invalid Args: SOAP Envelope missing")
+                            currentBodyDepth == null && depth == 2 && name == "Body" && namespace == envelopeNamespace ->
+                                bodyDepth = depth
+                            currentBodyDepth != null && currentActionDepth == null &&
+                                depth == currentBodyDepth + 1 -> {
+                                actionDepth = depth
+                                actionName = name.trim().takeIf { it.isNotEmpty() }
+                                    ?: throw UpnpFault(401, "SOAP action name missing")
+                                actionNamespace = namespace
+                            }
+                            currentActionDepth != null && !actionClosed && currentArgumentDepth == null &&
+                                depth == currentActionDepth + 1 -> {
+                                argumentDepth = depth
+                                argumentName = name.trim()
+                                argumentText.setLength(0)
+                            }
+                        }
+                    }
+                    XmlPullParser.TEXT, XmlPullParser.CDSECT -> {
+                        val currentArgumentDepth = argumentDepth
+                        if (currentArgumentDepth != null && parser.depth >= currentArgumentDepth) {
+                            argumentText.append(parser.text.orEmpty())
+                        }
+                    }
+                    XmlPullParser.ENTITY_REF -> {
+                        // With DTD declarations rejected above, only built-in and numeric XML
+                        // references can be resolved safely. Unknown/external references have no text.
+                        val replacement = parser.text
+                            ?: throw UpnpFault(402, "Invalid Args: unresolved entity references are not allowed")
+                        val currentArgumentDepth = argumentDepth
+                        if (currentArgumentDepth != null && parser.depth >= currentArgumentDepth) {
+                            argumentText.append(replacement)
+                        }
+                    }
+                    XmlPullParser.DOCDECL ->
+                        throw UpnpFault(402, "Invalid Args: DTD declarations are not allowed")
+                    XmlPullParser.END_TAG -> {
+                        if (argumentDepth != null && parser.depth == argumentDepth) {
+                            argumentName?.takeIf { it.isNotEmpty() }?.let { name ->
+                                arguments[name] = argumentText.toString().trim()
+                            }
+                            argumentDepth = null
+                            argumentName = null
+                            argumentText.setLength(0)
+                        }
+                        if (actionDepth != null && parser.depth == actionDepth) {
+                            actionClosed = true
+                        }
+                    }
+                }
+                event = parser.nextToken()
             }
+
+            val parsedActionName = actionName ?: throw UpnpFault(401, "SOAP action missing")
+            val parsedEnvelopeNamespace = envelopeNamespace
+                ?: throw UpnpFault(402, "Invalid Args: SOAP Envelope missing")
+            if (bodyDepth == null) throw UpnpFault(402, "Invalid Args: SOAP Body missing")
             return SoapActionRequest(
-                actionName = actionName,
+                actionName = parsedActionName,
                 arguments = arguments,
                 actionNamespace = actionNamespace,
-                envelopeNamespace = envelope.namespaceURI.orEmpty(),
+                envelopeNamespace = parsedEnvelopeNamespace,
                 serviceVersion = serviceVersionForNamespace(actionNamespace),
             )
         } catch (fault: UpnpFault) {
@@ -144,14 +210,6 @@ object SoapXml {
         }
         val actionName = value.substringAfterLast('#', value).trim().trim('"', '\'').trim()
         return actionName.takeIf { it.isNotEmpty() }
-    }
-
-    private fun localName(element: Element): String =
-        element.localName ?: element.tagName.substringAfter(':')
-
-    private fun childElements(parent: Element): List<Element> {
-        val children = parent.childNodes
-        return (0 until children.length).mapNotNull { children.item(it) as? Element }
     }
 
     fun response(actionName: String, serviceType: String, outputs: List<Pair<String, String>>): String {

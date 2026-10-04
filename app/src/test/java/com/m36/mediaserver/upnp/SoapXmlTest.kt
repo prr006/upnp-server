@@ -3,6 +3,7 @@ package com.m36.mediaserver.upnp
 import java.io.StringReader
 import javax.xml.parsers.DocumentBuilderFactory
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.xml.sax.InputSource
@@ -58,6 +59,21 @@ class SoapXmlTest {
         assertEquals(CONTENT_DIRECTORY_NS, request.actionNamespace)
         assertEquals(SoapServiceVersion.CONTENT_DIRECTORY_1, request.serviceVersion)
         assertTrue(request.arguments.isEmpty())
+    }
+
+    @Test
+    fun rejectsDoctypeAndExternalEntityDeclarationsBeforeParsing() {
+        val xml = """<!DOCTYPE s:Envelope [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+            <s:Envelope xmlns:s="$SOAP_NS">
+              <s:Body>
+                <u:GetSystemUpdateID xmlns:u="$CONTENT_DIRECTORY_NS"><Value>&xxe;</Value></u:GetSystemUpdateID>
+              </s:Body>
+            </s:Envelope>""".trimIndent()
+
+        val fault = assertThrows(UpnpFault::class.java) { SoapXml.parseAction(xml) }
+
+        assertEquals(402, fault.errorCode)
+        assertTrue(fault.message.contains("DTD and entity declarations"))
     }
 
     @Test

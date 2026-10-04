@@ -48,5 +48,6 @@ android {
 
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("net.sf.kxml:kxml2:2.3.0")
     testImplementation("junit:junit:4.13.2")
 }

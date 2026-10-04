@@ -16,7 +16,7 @@ import org.xml.sax.InputSource
 
 class ContentDirectoryServiceTest {
     @Test
-    fun exactVlcBrowseSoapDispatchesContentDirectory1AndReturnsSelectedFolderChildren() {
+    fun exactVlcBrowseSoapParsesWithoutJaxpFeaturesAndDispatchesValidBrowseResponse() {
         val soapAction = "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\""
         val requestBody = """<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 <s:Body>
