@@ -2,6 +2,8 @@ package com.m36.mediaserver.http
 
 import android.content.Context
 import com.m36.mediaserver.data.MediaHttpExchange
+import com.m36.mediaserver.data.MediaHttpInstant
+import com.m36.mediaserver.data.MediaHttpTimeline
 import com.m36.mediaserver.data.ServerMetrics
 import com.m36.mediaserver.media.DocumentTreeRepository
 import com.m36.mediaserver.network.NetworkSnapshot
@@ -33,7 +35,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Small HTTP/1.1 server with bounded worker count and streaming, seekable media responses. */
+/** Small HTTP/1.1 server with bounded workers and streaming media; each client socket serves one request. */
 class LocalHttpServer(
     context: Context,
     private val repository: DocumentTreeRepository,
@@ -364,6 +366,7 @@ class LocalHttpServer(
         clientAddress: String,
     ) {
         val sequence = metrics.nextMediaHttpSequence()
+        val timeline = MediaHttpTimeline(request.receivedAt)
         val node = repository.metadataNodeForToken(token)
         val rangeHeader = request.headers["range"]
         var effectiveMediaLength: Long? = null
@@ -371,7 +374,58 @@ class LocalHttpServer(
         var safAssetLength: Long? = null
         var safDescriptorStatSize: Long? = null
         val method = if (headOnly) "HEAD" else request.method
+        val userAgentHeader = request.rawHeaderLines("user-agent").joinToString("\n").ifEmpty { null }
+        val rawRangeHeader = request.rawHeaderLines("range").joinToString("\n").ifEmpty { null }
+        val rawConnectionHeaders = request.rawHeaderLines("connection")
+        val rawTransferEncodingHeaders = request.rawHeaderLines("transfer-encoding")
 
+        fun exchange(result: MediaHttpTransferResult?): MediaHttpExchange = MediaHttpExchange(
+            sequence = sequence,
+            clientIp = clientAddress,
+            method = request.rawMethod,
+            requestTarget = request.target,
+            resourcePath = request.path,
+            mediaId = token,
+            objectId = node?.objectId,
+            mediaTitle = node?.title,
+            userAgentHeader = userAgentHeader,
+            rangeHeader = rawRangeHeader,
+            requestConnectionHeaders = rawConnectionHeaders,
+            requestTransferEncodingHeaders = rawTransferEncodingHeaders,
+            requestKind = result?.requestKind ?: "PENDING",
+            requestedStartOffset = result?.requestedStartOffset,
+            requestedEndOffset = result?.requestedEndOffset,
+            requestedSuffixLength = result?.requestedSuffixLength,
+            responseStatus = result?.status ?: 0,
+            responseReason = result?.reason ?: "In progress",
+            responseContentType = result?.contentType,
+            responseContentLength = result?.contentLength,
+            responseContentRange = result?.contentRange,
+            responseAcceptRanges = result?.acceptRanges,
+            responseConnection = result?.responseConnection,
+            responseTransferEncoding = result?.responseTransferEncoding,
+            effectiveMediaLength = effectiveMediaLength,
+            safOpenedFileSize = safOpenedFileSize,
+            safAssetFileDescriptorLength = safAssetLength,
+            safDescriptorStatSize = safDescriptorStatSize,
+            didlRequestedSize = node?.size?.takeIf { it >= 0 },
+            actualMediaStartOffset = result?.actualMediaStartOffset,
+            actualMediaEndOffsetInclusive = result?.actualMediaEndOffsetInclusive,
+            actualSourceStartOffset = result?.actualSourceStartOffset,
+            actualSourceEndOffsetInclusive = result?.actualSourceEndOffsetInclusive,
+            bytesReadFromSaf = result?.bytesRead ?: 0L,
+            bytesWrittenToResponse = result?.bytesWritten ?: 0L,
+            complete = result?.complete ?: false,
+            eofReached = result?.eofReached ?: false,
+            prematureEof = result?.prematureEof ?: false,
+            error = result?.error,
+            timing = timeline.snapshot(),
+            failureKind = result?.failureKind,
+            failureStage = result?.failureStage,
+        )
+
+        // Register before opening SAF so a live diagnosis can show slow or still-active startup work.
+        metrics.beginMediaHttpExchange(exchange(null), timeline)
         val result = if (token.isBlank() || token.contains('/') || token.contains("..")) {
             MediaHttpResponseWriter.writeErrorResponse(
                 output = output,
@@ -381,12 +435,22 @@ class LocalHttpServer(
                 method = method,
                 rangeHeader = rangeHeader,
                 error = "Invalid media resource ID",
+                timeline = timeline,
+                failureKind = "INVALID_MEDIA_ID",
+                failureStage = "ROUTING",
             )
         } else {
-            val openAttempt = runCatching { repository.openMedia(token) }
+            timeline.safOpenStarted = MediaHttpInstant.now()
+            val openAttempt = runCatching {
+                val cachedNode = node ?: throw java.io.FileNotFoundException("Media item is not in the browsed SAF catalog")
+                repository.openMedia(cachedNode)
+            }
+            timeline.safOpenCompleted = MediaHttpInstant.now()
             val media = openAttempt.getOrNull()
             if (media == null) {
-                val cause = openAttempt.exceptionOrNull()?.let { ": ${it.message ?: it.javaClass.simpleName}" }.orEmpty()
+                val cause = openAttempt.exceptionOrNull()?.let {
+                    ": ${it.javaClass.simpleName}: ${it.message ?: "(no detail)"}"
+                }.orEmpty()
                 MediaHttpResponseWriter.writeErrorResponse(
                     output = output,
                     status = 404,
@@ -395,6 +459,9 @@ class LocalHttpServer(
                     method = method,
                     rangeHeader = rangeHeader,
                     error = "SAF media resource could not be opened$cause",
+                    timeline = timeline,
+                    failureKind = "SAF_OPEN_ERROR",
+                    failureStage = "SAF_OPEN",
                 )
             } else {
                 media.use { opened ->
@@ -410,54 +477,14 @@ class LocalHttpServer(
                         reportedMimeType = node?.mimeType,
                         media = opened,
                         didlSize = node?.size,
+                        timeline = timeline,
                     )
                 }
             }
         }
 
-        metrics.recordMediaHttpExchange(
-            MediaHttpExchange(
-                sequence = sequence,
-                clientIp = clientAddress,
-                method = request.rawMethod,
-                requestTarget = request.target,
-                resourcePath = request.path,
-                mediaId = token,
-                objectId = node?.objectId,
-                mediaTitle = node?.title,
-                userAgentHeader = request.rawHeaderLines("user-agent").joinToString("\n").ifEmpty { null },
-                rangeHeader = request.rawHeaderLines("range").joinToString("\n").ifEmpty { null },
-                requestConnectionHeaders = request.rawHeaderLines("connection"),
-                requestTransferEncodingHeaders = request.rawHeaderLines("transfer-encoding"),
-                requestKind = result.requestKind,
-                requestedStartOffset = result.requestedStartOffset,
-                requestedEndOffset = result.requestedEndOffset,
-                requestedSuffixLength = result.requestedSuffixLength,
-                responseStatus = result.status,
-                responseReason = result.reason,
-                responseContentType = result.contentType,
-                responseContentLength = result.contentLength,
-                responseContentRange = result.contentRange,
-                responseAcceptRanges = result.acceptRanges,
-                responseConnection = result.responseConnection,
-                responseTransferEncoding = result.responseTransferEncoding,
-                effectiveMediaLength = effectiveMediaLength,
-                safOpenedFileSize = safOpenedFileSize,
-                safAssetFileDescriptorLength = safAssetLength,
-                safDescriptorStatSize = safDescriptorStatSize,
-                didlRequestedSize = node?.size?.takeIf { it >= 0 },
-                actualMediaStartOffset = result.actualMediaStartOffset,
-                actualMediaEndOffsetInclusive = result.actualMediaEndOffsetInclusive,
-                actualSourceStartOffset = result.actualSourceStartOffset,
-                actualSourceEndOffsetInclusive = result.actualSourceEndOffsetInclusive,
-                bytesReadFromSaf = result.bytesRead,
-                bytesWrittenToResponse = result.bytesWritten,
-                complete = result.complete,
-                eofReached = result.eofReached,
-                prematureEof = result.prematureEof,
-                error = result.error,
-            ),
-        )
+        timeline.completed = MediaHttpInstant.now()
+        metrics.recordMediaHttpExchange(exchange(result))
     }
 
     private fun baseUrlFor(socket: Socket): String {
@@ -517,7 +544,17 @@ class LocalHttpServer(
         if (contentLength > MAX_REQUEST_BODY_BYTES) throw RequestTooLargeException()
         val body = ByteArray(contentLength.toInt())
         if (body.isNotEmpty()) DataInputStream(input).readFully(body)
-        return HttpRequest(method, rawMethod, rawTarget, path, headers, rawHeaders, headerLines, body)
+        return HttpRequest(
+            method = method,
+            rawMethod = rawMethod,
+            target = rawTarget,
+            path = path,
+            headers = headers,
+            rawHeaders = rawHeaders,
+            headerLines = headerLines,
+            body = body,
+            receivedAt = MediaHttpInstant.now(),
+        )
     }
 
     private fun normalizePath(target: String): String {
@@ -588,6 +625,7 @@ class LocalHttpServer(
         val rawHeaders: Map<String, String>,
         val headerLines: List<String>,
         val body: ByteArray,
+        val receivedAt: MediaHttpInstant,
     ) {
         fun rawHeaderLines(name: String): List<String> = headerLines.filter { line ->
             line.substringBefore(':').trim().equals(name, ignoreCase = true)

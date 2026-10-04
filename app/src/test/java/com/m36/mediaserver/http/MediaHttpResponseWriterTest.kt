@@ -4,20 +4,31 @@ import com.m36.mediaserver.media.MediaNode
 import com.m36.mediaserver.media.MediaPayload
 import com.m36.mediaserver.media.seekFileInputStream
 import com.m36.mediaserver.upnp.UpnpXml
+import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.io.IOException
+import java.io.OutputStream
 import java.io.StringReader
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.SocketException
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.Locale
 import javax.xml.parsers.DocumentBuilderFactory
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -360,6 +371,8 @@ class MediaHttpResponseWriterTest {
         assertTrue(result.eofReached)
         assertTrue(result.prematureEof)
         assertFalse(result.complete)
+        assertEquals("UNEXPECTED_EOF", result.failureKind)
+        assertEquals("SAF_READ", result.failureStage)
         assertTrue(result.error.orEmpty().contains("ended early"))
         assertTrue(response.body.size < response.headers.getValue("content-length").toInt())
         assertArrayEquals(actualBytes, response.body)
@@ -389,6 +402,216 @@ class MediaHttpResponseWriterTest {
         assertFalse(response.headers.containsKey("transfer-encoding"))
         assertTrue(result.complete)
         assertFalse(response.body.contentEquals(bytes))
+    }
+
+    @Test
+    fun offsetZeroRangeDoesNotSeekOrDiscardBytesOnAZeroBasedSource() {
+        val bytes = sampleMkvBytes(4_097)
+        val media = object : MediaPayload {
+            override val stream: InputStream = ByteArrayInputStream(bytes)
+            override val length: Long = bytes.size.toLong()
+            override val startOffset: Long = 0
+            override fun seek(relativePosition: Long) {
+                throw IOException("offset-zero range should not seek")
+            }
+            override fun close() = Unit
+        }
+        val output = ByteArrayOutputStream()
+        val result = MediaHttpResponseWriter.serve(
+            output = output,
+            method = "GET",
+            rangeHeader = "bytes=0-",
+            title = "zero-based.mkv",
+            reportedMimeType = "video/x-matroska",
+            media = media,
+            didlSize = bytes.size.toLong(),
+        )
+        val response = parseResponse(output.toByteArray())
+
+        assertEquals(206, result.status)
+        assertTrue(result.complete)
+        assertEquals("bytes 0-${bytes.lastIndex}/${bytes.size}", response.headers["content-range"])
+        assertArrayEquals(bytes, response.body)
+    }
+
+    @Test
+    fun unknownMalformedAndUnsupportedMultiRangesAreIgnoredInsteadOfMisreportedAs416() {
+        val bytes = sampleMkvBytes()
+        listOf("items=0-9", "bytes=0-9,20-29", "bytes=not-a-range").forEach { header ->
+            val transfer = serve(bytes, "GET", header)
+
+            assertEquals("IGNORED_RANGE", transfer.result.requestKind)
+            assertEquals(200, transfer.result.status)
+            assertNull(transfer.response.headers["content-range"])
+            assertEquals(bytes.size.toString(), transfer.response.headers["content-length"])
+            assertArrayEquals(bytes, transfer.response.body)
+            assertTrue(transfer.result.complete)
+        }
+    }
+
+    @Test
+    fun seekFailureOnAValidRangeIsAStorageErrorNotAFalse416() {
+        val bytes = sampleMkvBytes()
+        val output = ByteArrayOutputStream()
+        val result = TemporaryMkvPayload(bytes, failOnSeek = true).use { source ->
+            MediaHttpResponseWriter.serve(
+                output = BufferedOutputStream(output),
+                method = "GET",
+                rangeHeader = "bytes=10-19",
+                title = "Sakamoto Days E13.mkv",
+                reportedMimeType = "video/x-matroska",
+                media = source,
+                didlSize = bytes.size.toLong(),
+            )
+        }
+        val response = parseResponse(output.toByteArray())
+
+        assertEquals(500, result.status)
+        assertEquals("Internal Server Error", result.reason)
+        assertNull(response.headers["content-range"])
+        assertEquals("SAF_SEEK_ERROR", result.failureKind)
+        assertEquals("SAF_SEEK", result.failureStage)
+        assertTrue(result.complete)
+        assertTrue(result.error.orEmpty().contains("injected seek failure"))
+    }
+
+    @Test
+    fun brokenPipeIsRecordedAsPeerDisconnectAndNeverAsComplete() {
+        val bytes = sampleMkvBytes(512 * 1024)
+        val timeline = com.m36.mediaserver.data.MediaHttpTimeline()
+        val result = TemporaryMkvPayload(bytes).use { source ->
+            MediaHttpResponseWriter.serve(
+                output = FailAfterResponseHeadersOutputStream("Broken pipe"),
+                method = "GET",
+                rangeHeader = "bytes=0-",
+                title = "Sakamoto Days E13.mkv",
+                reportedMimeType = "video/x-matroska",
+                media = source,
+                didlSize = bytes.size.toLong(),
+                timeline = timeline,
+            )
+        }
+
+        assertEquals("PEER_DISCONNECTED", result.failureKind)
+        assertEquals("RESPONSE_WRITE", result.failureStage)
+        assertFalse(result.complete)
+        assertFalse(result.eofReached)
+        assertFalse(result.prematureEof)
+        assertEquals(128L * 1024L, result.bytesRead)
+        assertEquals(0L, result.bytesWritten)
+        assertTrue(result.error.orEmpty().contains("Broken pipe"))
+        assertNotNull(timeline.headersSent)
+        assertNotNull(timeline.clientDisconnected)
+        assertNull(timeline.firstMediaByte)
+    }
+
+    @Test
+    fun safReadIoFailureIsNotClassifiedAsClientCancellation() {
+        val source = object : MediaPayload {
+            override val stream: InputStream = object : InputStream() {
+                override fun read(): Int = throw IOException("injected SAF read failure")
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+                    throw IOException("injected SAF read failure")
+            }
+            override val length: Long = 32
+            override val startOffset: Long = 0
+            override fun seek(relativePosition: Long) = Unit
+            override fun close() = Unit
+        }
+        val output = ByteArrayOutputStream()
+        val result = MediaHttpResponseWriter.serve(
+            output = output,
+            method = "GET",
+            rangeHeader = null,
+            title = "broken.mkv",
+            reportedMimeType = "video/x-matroska",
+            media = source,
+            didlSize = 32,
+        )
+
+        assertEquals("SERVER_IO_ERROR", result.failureKind)
+        assertEquals("SAF_READ", result.failureStage)
+        assertFalse(result.complete)
+        assertFalse(result.eofReached)
+        assertFalse(result.prematureEof)
+        assertEquals(0L, result.bytesRead)
+        assertEquals(0L, result.bytesWritten)
+        assertTrue(result.error.orEmpty().contains("injected SAF read failure"))
+    }
+
+    @Test
+    fun loopbackSocketControlPreservesRangeFramingAndExplicitCloseBehavior() {
+        val bytes = sampleMkvBytes(8 * 1024 + 17)
+        val start = 313
+        val end = 1_777
+        val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val serverResult = executor.submit<MediaHttpTransferResult> {
+                server.accept().use { peer ->
+                    peer.soTimeout = 5_000
+                    val input = BufferedInputStream(peer.getInputStream())
+                    assertEquals("GET /media/control HTTP/1.1", readHttpLine(input))
+                    var range: String? = null
+                    var sawKeepAlive = false
+                    while (true) {
+                        val line = readHttpLine(input)
+                        if (line.isEmpty()) break
+                        if (line.startsWith("Range:", ignoreCase = true)) range = line.substringAfter(':').trim()
+                        if (line.equals("Connection: keep-alive", ignoreCase = true)) sawKeepAlive = true
+                    }
+                    assertTrue("control request should exercise a client keep-alive preference", sawKeepAlive)
+                    TemporaryMkvPayload(bytes).use { source ->
+                        MediaHttpResponseWriter.serve(
+                            output = peer.getOutputStream(),
+                            method = "GET",
+                            rangeHeader = range,
+                            title = "control.mkv",
+                            reportedMimeType = "video/x-matroska",
+                            media = source,
+                            didlSize = bytes.size.toLong(),
+                        )
+                    }
+                }
+            }
+
+            val responseBytes = Socket(InetAddress.getLoopbackAddress(), server.localPort).use { client ->
+                client.soTimeout = 5_000
+                client.getOutputStream().write(
+                    ("GET /media/control HTTP/1.1\r\n" +
+                        "Host: 127.0.0.1\r\n" +
+                        "Range: bytes=$start-$end\r\n" +
+                        "Connection: keep-alive\r\n\r\n").toByteArray(StandardCharsets.US_ASCII),
+                )
+                client.getOutputStream().flush()
+                client.getInputStream().readBytes()
+            }
+            val result = serverResult.get(5, TimeUnit.SECONDS)
+            val response = parseResponse(responseBytes)
+
+            assertEquals(206, result.status)
+            assertTrue(result.complete)
+            assertEquals("HTTP/1.1 206 Partial Content", response.statusLine)
+            assertEquals("bytes $start-$end/${bytes.size}", response.headers["content-range"])
+            assertEquals((end - start + 1).toString(), response.headers["content-length"])
+            assertEquals("close", response.headers["connection"])
+            assertFalse(response.headers.containsKey("transfer-encoding"))
+            assertArrayEquals(bytes.copyOfRange(start, end + 1), response.body)
+        } finally {
+            server.close()
+            executor.shutdownNow()
+        }
+    }
+
+    private fun readHttpLine(input: InputStream): String {
+        val line = ByteArrayOutputStream()
+        while (true) {
+            val value = input.read()
+            if (value < 0) throw AssertionError("Unexpected EOF in loopback HTTP control request")
+            if (value == '\n'.code) break
+            if (value != '\r'.code) line.write(value)
+        }
+        return line.toString(StandardCharsets.ISO_8859_1.name())
     }
 
     private fun serve(bytes: ByteArray, method: String, range: String): TransferAndResponse {
@@ -456,6 +679,7 @@ class MediaHttpResponseWriterTest {
         override val openedFileSize: Long? = payload.size.toLong(),
         override val assetFileDescriptorLength: Long? = openedFileSize,
         override val descriptorStatSize: Long? = 5L + payload.size,
+        private val failOnSeek: Boolean = false,
     ) : MediaPayload {
         private val file: File = Files.createTempFile("m36-mkv-range-test", ".mkv").toFile()
         private val assetPrefix = byteArrayOf(0x51, 0x22, 0x7f, 0x11, 0x03)
@@ -475,6 +699,7 @@ class MediaHttpResponseWriterTest {
 
         override fun seek(relativePosition: Long) {
             lastSeekRelativeOffset = relativePosition
+            if (failOnSeek) throw IOException("injected seek failure")
             seekFileInputStream(fileStream, startOffset, relativePosition)
         }
 
@@ -482,6 +707,32 @@ class MediaHttpResponseWriterTest {
             fileStream.close()
             Files.deleteIfExists(file.toPath())
         }
+    }
+
+    private class FailAfterResponseHeadersOutputStream(
+        private val failureMessage: String,
+    ) : OutputStream() {
+        private var previous3 = -1
+        private var previous2 = -1
+        private var previous1 = -1
+        private var responseHeadersComplete = false
+
+        override fun write(value: Int) {
+            if (responseHeadersComplete) throw SocketException(failureMessage)
+            val current = value and 0xff
+            if (previous3 == 13 && previous2 == 10 && previous1 == 13 && current == 10) {
+                responseHeadersComplete = true
+            }
+            previous3 = previous2
+            previous2 = previous1
+            previous1 = current
+        }
+
+        override fun write(buffer: ByteArray, offset: Int, length: Int) {
+            for (index in offset until offset + length) write(buffer[index].toInt())
+        }
+
+        override fun flush() = Unit
     }
 
     private companion object {

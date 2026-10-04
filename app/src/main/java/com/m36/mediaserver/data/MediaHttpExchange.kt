@@ -41,9 +41,14 @@ data class MediaHttpExchange(
     val eofReached: Boolean,
     val prematureEof: Boolean,
     val error: String?,
+    val timing: MediaHttpTimingSnapshot? = null,
+    val failureKind: String? = null,
+    val failureStage: String? = null,
 ) {
+    val inProgress: Boolean get() = timing?.completed == null && responseStatus == 0
+
     fun format(): String = buildString {
-        appendLine("REQUEST $sequence")
+        appendLine("REQUEST $sequence${if (inProgress) " — IN PROGRESS" else ""}")
         appendLine("$method $resourcePath")
         if (requestTarget != resourcePath) appendLine("Request target: $requestTarget")
         appendLine("Client IP: $clientIp")
@@ -57,7 +62,11 @@ data class MediaHttpExchange(
         appendLine("Requested start offset: ${requestedStartOffset?.toString() ?: "(not specified)"}")
         appendLine("Requested end offset: ${requestedEndOffset?.toString() ?: if (requestKind == "OPEN_ENDED_RANGE") "(open-ended)" else "(not specified)"}")
         if (requestedSuffixLength != null) appendLine("Requested suffix length: $requestedSuffixLength")
-        appendLine("-> $responseStatus $responseReason")
+        if (responseStatus > 0) {
+            appendLine("-> $responseStatus $responseReason")
+        } else {
+            appendLine("-> (response not finished)")
+        }
         appendLine("Content-Type: ${responseContentType ?: "(not set)"}")
         appendLine("Content-Length: ${responseContentLength?.toString() ?: "(not set)"}")
         appendLine("Content-Range: ${responseContentRange ?: "(not set)"}")
@@ -77,15 +86,66 @@ data class MediaHttpExchange(
         appendLine("SAF opened size vs DIDL size: $sizeCheck")
         appendLine("Actual media stream offsets (inclusive): ${formatOffsets(actualMediaStartOffset, actualMediaEndOffsetInclusive)}")
         appendLine("Actual underlying source offsets (inclusive): ${formatOffsets(actualSourceStartOffset, actualSourceEndOffsetInclusive)}")
-        appendLine("Response-confirmed media offsets (inclusive): ${formatWrittenOffsets(actualMediaStartOffset, bytesWrittenToResponse)}")
-        appendLine("Response-confirmed source offsets (inclusive): ${formatWrittenOffsets(actualSourceStartOffset, bytesWrittenToResponse)}")
+        appendLine("Write-confirmed media offsets (inclusive): ${formatWrittenOffsets(actualMediaStartOffset, bytesWrittenToResponse)}")
+        appendLine("Write-confirmed source offsets (inclusive): ${formatWrittenOffsets(actualSourceStartOffset, bytesWrittenToResponse)}")
         appendLine("Bytes read from SAF: $bytesReadFromSaf")
         appendLine("Bytes written to response: $bytesWrittenToResponse")
+        appendTiming(timing)
         appendLine("EOF reached: $eofReached")
         appendLine("Premature EOF: $prematureEof")
-        appendLine("Complete: ${if (complete) "YES" else "NO"}")
-        error?.takeIf { it.isNotBlank() }?.let { appendLine("EOF/error detail: $it") }
+        appendLine("HTTP response entity complete: ${if (complete) "YES" else "NO"}")
+        if (failureKind != null || failureStage != null) {
+            appendLine("Failure classification: ${failureKind ?: "(unclassified)"}${failureStage?.let { " at $it" }.orEmpty()}")
+        }
+        error?.takeIf { it.isNotBlank() }?.let { appendLine("Error detail: $it") }
     }.trimEnd()
+
+    private fun StringBuilder.appendTiming(timing: MediaHttpTimingSnapshot?) {
+        if (timing == null) {
+            appendLine("Timing: (not captured)")
+            return
+        }
+        appendLine("Request received: ${timing.requestReceived.formatLocal()}")
+        if (inProgress) {
+            val ageMillis = (System.nanoTime() - timing.requestReceived.monotonicNanos)
+                .coerceAtLeast(0L) / 1_000_000L
+            appendLine("Current request age: ${ageMillis}ms (still in progress)")
+        }
+        appendEvent("SAF open started", timing.safOpenStarted, timing)
+        appendEvent("SAF open completed", timing.safOpenCompleted, timing)
+        timing.durationMillis(timing.safOpenStarted, timing.safOpenCompleted)?.let {
+            appendLine("SAF open duration: ${it}ms")
+        }
+        appendEvent("SAF seek started", timing.safSeekStarted, timing)
+        appendEvent("SAF seek completed", timing.safSeekCompleted, timing)
+        timing.durationMillis(timing.safSeekStarted, timing.safSeekCompleted)?.let {
+            appendLine("SAF seek duration: ${it}ms")
+        }
+        appendEvent("Response headers sent", timing.headersSent, timing)
+        appendEvent("First media byte", timing.firstMediaByte, timing)
+        timing.elapsedMillis(timing.firstMediaByte)?.let { appendLine("Time to first media byte: ${it}ms from request") }
+        appendEvent("Last media byte", timing.lastMediaByte, timing)
+        val payloadDuration = timing.durationMillis(timing.firstMediaByte, timing.lastMediaByte)
+        if (payloadDuration != null) {
+            appendLine("First-to-last media byte span: ${payloadDuration}ms")
+            formatBytesPerSecond(bytesWrittenToResponse, payloadDuration)?.let {
+                appendLine("Media write rate: $it (response bytes / first-to-last-byte span)")
+            }
+        }
+        appendEvent("Peer disconnect/cancellation", timing.clientDisconnected, timing)
+        appendEvent("Server completion", timing.completed, timing)
+        timing.totalDurationMillis()?.let { appendLine("Total request duration: ${it}ms") }
+    }
+
+    private fun StringBuilder.appendEvent(
+        label: String,
+        instant: MediaHttpInstant?,
+        timing: MediaHttpTimingSnapshot,
+    ) {
+        if (instant == null) return
+        val elapsed = timing.elapsedMillis(instant)
+        appendLine("$label: ${instant.formatLocal()}${elapsed?.let { " (T+${it}ms)" }.orEmpty()}")
+    }
 
     private fun formatOffsets(start: Long?, endInclusive: Long?): String = when {
         start == null -> "(not reached)"
@@ -98,5 +158,11 @@ data class MediaHttpExchange(
         byteCount <= 0 -> "$start .. (no bytes written)"
         start < 0 || Long.MAX_VALUE - start < byteCount - 1 -> "$start .. (end offset overflow)"
         else -> "$start .. ${start + byteCount - 1}"
+    }
+
+    private fun formatBytesPerSecond(bytes: Long, durationMillis: Long): String? {
+        if (bytes <= 0 || durationMillis <= 0) return null
+        val bytesPerSecond = bytes * 1_000.0 / durationMillis
+        return String.format(java.util.Locale.US, "%.2f MiB/s", bytesPerSecond / (1024.0 * 1024.0))
     }
 }

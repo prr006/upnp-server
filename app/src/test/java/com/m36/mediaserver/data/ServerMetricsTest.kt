@@ -1,6 +1,7 @@
 package com.m36.mediaserver.data
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -45,13 +46,18 @@ class ServerMetricsTest {
         assertTrue(latest.contains("SAF opened size vs DIDL size: MATCH"))
         assertTrue(latest.contains("Actual media stream offsets (inclusive): 90 .. 99"))
         assertTrue(latest.contains("Actual underlying source offsets (inclusive): 95 .. 104"))
-        assertTrue(latest.contains("Response-confirmed media offsets (inclusive): 90 .. 99"))
-        assertTrue(latest.contains("Response-confirmed source offsets (inclusive): 95 .. 104"))
+        assertTrue(latest.contains("Write-confirmed media offsets (inclusive): 90 .. 99"))
+        assertTrue(latest.contains("Write-confirmed source offsets (inclusive): 95 .. 104"))
         assertTrue(latest.contains("Bytes read from SAF: 10"))
         assertTrue(latest.contains("Bytes written to response: 10"))
         assertTrue(latest.contains("EOF reached: false"))
         assertTrue(latest.contains("Premature EOF: false"))
-        assertTrue(latest.contains("Complete: YES"))
+        assertTrue(latest.contains("HTTP response entity complete: YES"))
+        assertTrue(latest.contains("Response headers sent:"))
+        assertTrue(latest.contains("Time to first media byte: 9ms from request"))
+        assertTrue(latest.contains("SAF open duration: 2ms"))
+        assertTrue(latest.contains("SAF seek duration: 1ms"))
+        assertTrue(latest.contains("Total request duration: 20ms"))
     }
 
     @Test
@@ -73,6 +79,68 @@ class ServerMetricsTest {
         assertTrue(metrics.firstMediaHttpExchange.startsWith("REQUEST 1\n"))
         assertTrue(history.first().startsWith("REQUEST 7\n"))
         assertTrue(history.last().startsWith("REQUEST 70\n"))
+    }
+
+    @Test
+    fun playbackSummaryCountsPeerDisconnectsWithoutCallingThemEofOrServerIoErrors() {
+        val metrics = ServerMetrics()
+        val peerSequence = metrics.nextMediaHttpSequence()
+        val peerTiming = timing(peerSequence).let { base ->
+            base.copy(
+                clientDisconnected = MediaHttpInstant(
+                    epochMillis = base.requestReceived.epochMillis + 12,
+                    monotonicNanos = base.requestReceived.monotonicNanos + 12_000_000,
+                ),
+            )
+        }
+        metrics.recordMediaHttpExchange(
+            exchange(peerSequence, "GET", "OPEN_ENDED_RANGE", 90, null).copy(
+                complete = false,
+                failureKind = "PEER_DISCONNECTED",
+                failureStage = "RESPONSE_WRITE",
+                error = "SocketException: Broken pipe",
+                timing = peerTiming,
+            ),
+        )
+        val eofSequence = metrics.nextMediaHttpSequence()
+        metrics.recordMediaHttpExchange(
+            exchange(eofSequence, "GET", "OPEN_ENDED_RANGE", 91, null).copy(
+                complete = false,
+                prematureEof = true,
+                eofReached = true,
+                failureKind = "UNEXPECTED_EOF",
+                failureStage = "SAF_READ",
+                error = "EOFException: Media stream ended early",
+            ),
+        )
+        val activeSequence = metrics.nextMediaHttpSequence()
+        metrics.beginMediaHttpExchange(
+            exchange(activeSequence, "GET", "FULL_GET", null, null).copy(
+                responseStatus = 0,
+                responseReason = "In progress",
+                responseContentLength = null,
+                complete = false,
+                timing = timing(activeSequence).copy(
+                    headersSent = null,
+                    firstMediaByte = null,
+                    lastMediaByte = null,
+                    completed = null,
+                ),
+            ),
+        )
+
+        val summary = metrics.mediaPlaybackSummarySnapshot()
+        assertTrue(summary.contains("Requests: 3 total; 2 finalized; 1 active"))
+        assertTrue(summary.contains("Ranges: 2; non-zero start offsets (seek/reopen indications): 2"))
+        assertTrue(summary.contains("complete=0; incomplete=2; peer disconnects=1; Broken pipe=1; unexpected EOF=1; server I/O errors=0"))
+        assertTrue(summary.contains("First media byte:"))
+        assertTrue(summary.contains("Subtitle evidence:"))
+        assertFalse(summary.contains("peer disconnects=0"))
+
+        val highlights = metrics.mediaHttpHighlightsSnapshot()
+        assertEquals(3, highlights.size)
+        assertTrue(highlights.first().contains("Failure classification: PEER_DISCONNECTED at RESPONSE_WRITE"))
+        assertTrue(highlights.last().contains("IN PROGRESS"))
     }
 
     private fun exchange(
@@ -137,5 +205,26 @@ class ServerMetricsTest {
         eofReached = false,
         prematureEof = false,
         error = null,
+        timing = timing(sequence, hasBody = method != "HEAD"),
     )
+
+    private fun timing(sequence: Long, hasBody: Boolean = true): MediaHttpTimingSnapshot {
+        val requestWallMillis = 1_800_000_000_000L + sequence * 1_000L
+        val requestMonotonicNanos = sequence * 1_000_000_000L
+        fun at(offsetMillis: Long) = MediaHttpInstant(
+            epochMillis = requestWallMillis + offsetMillis,
+            monotonicNanos = requestMonotonicNanos + offsetMillis * 1_000_000L,
+        )
+        return MediaHttpTimingSnapshot(
+            requestReceived = at(0),
+            safOpenStarted = at(1),
+            safOpenCompleted = at(3),
+            safSeekStarted = at(4),
+            safSeekCompleted = at(5),
+            headersSent = at(7),
+            firstMediaByte = if (hasBody) at(9) else null,
+            lastMediaByte = if (hasBody) at(19) else null,
+            completed = at(20),
+        )
+    }
 }

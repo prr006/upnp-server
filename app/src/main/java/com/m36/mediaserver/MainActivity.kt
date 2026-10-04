@@ -31,6 +31,7 @@ class MainActivity : Activity() {
     private lateinit var ipView: TextView
     private lateinit var upnpView: TextView
     private lateinit var folderView: TextView
+    private lateinit var playbackSummaryView: TextView
     private lateinit var detailsView: TextView
     private lateinit var detailsButton: Button
     private lateinit var selectFolderButton: Button
@@ -163,6 +164,22 @@ class MainActivity : Activity() {
         content.addView(startButton, matchWidthWrap())
         content.addView(stopButton, matchWidthWrap())
 
+        content.addView(TextView(this).apply {
+            text = "PLAYBACK SUMMARY"
+            textSize = 11f
+            setTextColor(0xFF687684.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setPadding(0, dp(12), 0, dp(4))
+        }, matchWidthWrap())
+        playbackSummaryView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(0xFF243341.toInt())
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            setBackgroundColor(0xFFE7ECF0.toInt())
+            text = "No media requests yet"
+        }
+        content.addView(playbackSummaryView, matchWidthWrap())
+
         detailsButton = Button(this).apply {
             text = "Show Details"
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
@@ -221,6 +238,7 @@ class MainActivity : Activity() {
             append(if (running) "● ContentDirectory / HTTP running" else "○ ContentDirectory stopped")
         }
         folderView.text = "[$selectedFolderName]"
+        playbackSummaryView.text = diagnostics.mediaPlaybackSummary
         selectFolderButton.isEnabled = !running && !diagnostics.serverStatus.contains("Starting", true) &&
             !diagnostics.serverStatus.contains("Stopping", true)
         startButton.isEnabled = !running && preferences.sharedTreeUri != null &&
@@ -253,12 +271,22 @@ class MainActivity : Activity() {
             appendLine("SSDP responses sent: ${diagnostics.ssdpResponsesSent}")
             appendLine("HTTP request count: ${diagnostics.httpRequestCount}")
             appendLine("Last HTTP request: ${diagnostics.lastHttpRequest}")
-            appendLine("Media playback diagnosis:")
+            appendLine("Media playback diagnosis — Playback Summary:")
+            appendLine(diagnostics.mediaPlaybackSummary)
             appendLine("First media request observed:")
             appendLine(diagnostics.firstMediaHttpExchange)
-            appendLine("Most recent completed media request:")
+            appendLine("Most recently observed media request:")
             appendLine(diagnostics.lastMediaHttpExchange)
-            appendLine("Recent media request sequence (arrival order; up to 64):")
+            appendLine("Useful requests (ranges, seeks/reopens, incomplete transfers, or errors; up to 16):")
+            if (diagnostics.mediaHttpHighlights.isEmpty()) {
+                appendLine("  (none yet)")
+            } else {
+                diagnostics.mediaHttpHighlights.forEach { transaction ->
+                    appendLine(transaction)
+                    appendLine()
+                }
+            }
+            appendLine("Full media request history (arrival order; most recent 64):")
             if (diagnostics.mediaHttpHistory.isEmpty()) {
                 appendLine("  (no media requests yet)")
             } else {

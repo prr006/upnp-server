@@ -27,6 +27,8 @@ data class ServerDiagnostics(
     val lastHttpRequest: String = "—",
     val firstMediaHttpExchange: String = "—",
     val lastMediaHttpExchange: String = "—",
+    val mediaPlaybackSummary: String = "No media requests yet",
+    val mediaHttpHighlights: List<String> = emptyList(),
     val mediaHttpHistory: List<String> = emptyList(),
     val rootDescriptionGetCount: Long = 0,
     val lastRootDescriptionGet: String = "—",

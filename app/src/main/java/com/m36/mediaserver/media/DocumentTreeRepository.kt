@@ -169,6 +169,15 @@ class DocumentTreeRepository(context: Context, val treeUri: Uri) : MediaCatalog 
     @Throws(IOException::class)
     fun openMedia(token: String): OpenedMedia {
         val node = knownFilesByToken[token] ?: throw FileNotFoundException("Media item has not been browsed")
+        return openMedia(node)
+    }
+
+    @Throws(IOException::class)
+    fun openMedia(node: MediaNode): OpenedMedia {
+        // Browse has already cached this MediaNode/document ID; do not re-query the tree or source
+        // metadata on every VLC range request. Give each request a fresh descriptor so concurrent
+        // seeks never share a mutable FileChannel position.
+        if (node.isContainer) throw FileNotFoundException("Cannot open a directory as media")
         val documentId = node.documentId ?: throw FileNotFoundException("Missing SAF document ID")
         val asset = resolver.openAssetFileDescriptor(documentUri(documentId), "r")
             ?: throw FileNotFoundException("Storage provider could not open ${node.title}")

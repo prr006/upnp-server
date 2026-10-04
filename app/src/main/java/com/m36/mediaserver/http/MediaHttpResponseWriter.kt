@@ -1,9 +1,13 @@
 package com.m36.mediaserver.http
 
+import com.m36.mediaserver.data.MediaHttpInstant
+import com.m36.mediaserver.data.MediaHttpTimeline
 import com.m36.mediaserver.media.MediaPayload
 import com.m36.mediaserver.upnp.UpnpXml
 import java.io.EOFException
+import java.io.IOException
 import java.io.OutputStream
+import java.net.SocketException
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -33,6 +37,8 @@ internal data class MediaHttpTransferResult(
     val eofReached: Boolean,
     val prematureEof: Boolean,
     val error: String? = null,
+    val failureKind: String? = null,
+    val failureStage: String? = null,
 )
 
 /** One implementation of the media HTTP byte contract, shared by the server and JVM regressions. */
@@ -45,6 +51,9 @@ internal object MediaHttpResponseWriter {
         method: String,
         rangeHeader: String?,
         error: String,
+        timeline: MediaHttpTimeline = MediaHttpTimeline(),
+        failureKind: String? = null,
+        failureStage: String? = null,
     ): MediaHttpTransferResult = writeTextResponse(
         output = output,
         status = status,
@@ -55,6 +64,9 @@ internal object MediaHttpResponseWriter {
         rangeRequest = parseRangeRequest(rangeHeader, size = -1, method = method),
         method = method,
         error = error,
+        timeline = timeline,
+        failureKind = failureKind,
+        failureStage = failureStage,
     )
 
     fun serve(
@@ -65,12 +77,14 @@ internal object MediaHttpResponseWriter {
         reportedMimeType: String?,
         media: MediaPayload,
         didlSize: Long? = null,
+        timeline: MediaHttpTimeline = MediaHttpTimeline(),
     ): MediaHttpTransferResult {
+        val headOnly = method.equals("HEAD", ignoreCase = true)
         val size = media.length
         val rangeRequest = parseRangeRequest(rangeHeader, size, method)
         val selectedRange = rangeRequest.selectedRange
 
-        if (rangeRequest.invalid) {
+        if (rangeRequest.unsatisfiable) {
             val contentRange = if (size >= 0) "bytes */$size" else null
             return writeTextResponse(
                 output = output,
@@ -81,6 +95,9 @@ internal object MediaHttpResponseWriter {
                 contentRange = contentRange,
                 rangeRequest = rangeRequest,
                 method = method,
+                timeline = timeline,
+                failureKind = "UNSATISFIABLE_RANGE",
+                failureStage = "RANGE_VALIDATION",
             )
         }
 
@@ -97,6 +114,9 @@ internal object MediaHttpResponseWriter {
                 rangeRequest = rangeRequest,
                 method = method,
                 error = "SAF opened size=$openedSize differs from DIDL size=$advertisedSize",
+                timeline = timeline,
+                failureKind = "PREFLIGHT_REJECTED",
+                failureStage = "SIZE_VALIDATION",
             )
         }
         if (openedSize != null && size >= 0 && openedSize != size) {
@@ -110,6 +130,9 @@ internal object MediaHttpResponseWriter {
                 rangeRequest = rangeRequest,
                 method = method,
                 error = "SAF opened size=$openedSize differs from HTTP representation length=$size",
+                timeline = timeline,
+                failureKind = "PREFLIGHT_REJECTED",
+                failureStage = "SIZE_VALIDATION",
             )
         }
         val descriptorStatSize = media.descriptorStatSize?.takeIf { it >= 0 }
@@ -125,6 +148,9 @@ internal object MediaHttpResponseWriter {
                 rangeRequest = rangeRequest,
                 method = method,
                 error = "SAF descriptor stat size=$descriptorStatSize, but media requires source bytes through $requiredSourceEndExclusive",
+                timeline = timeline,
+                failureKind = "PREFLIGHT_REJECTED",
+                failureStage = "DESCRIPTOR_SIZE_VALIDATION",
             )
         }
         if (size < 0) {
@@ -138,26 +164,39 @@ internal object MediaHttpResponseWriter {
                 rangeRequest = rangeRequest,
                 method = method,
                 error = "No SAF opened size or DIDL size is available for Content-Length",
+                timeline = timeline,
+                failureKind = "PREFLIGHT_REJECTED",
+                failureStage = "CONTENT_LENGTH_VALIDATION",
             )
         }
 
         val mediaOffset = selectedRange?.start ?: 0L
-        try {
-            // Explicit byte ranges always seek relative to this asset. A non-zero AFD slice also
-            // requires positioning for a full GET/HEAD; ordinary zero-offset streams stay sequential.
-            if (selectedRange != null || media.startOffset > 0) media.seek(mediaOffset)
-        } catch (error: Exception) {
-            return writeTextResponse(
-                output = output,
-                status = 416,
-                reason = "Range Not Satisfiable",
-                message = "Selected storage provider does not support seeking this file",
-                acceptRanges = "bytes",
-                contentRange = "bytes */$size",
-                rangeRequest = rangeRequest,
-                method = method,
-                error = error.message ?: error.javaClass.simpleName,
-            )
+        // Position only when the GET body will start away from the descriptor's current asset start.
+        // Offset-zero ranges and HEAD requests require no SAF seek or byte-zero discard.
+        if (!headOnly && (mediaOffset > 0 || media.startOffset > 0)) {
+            timeline.safSeekStarted = MediaHttpInstant.now()
+            try {
+                media.seek(mediaOffset)
+            } catch (failure: Exception) {
+                timeline.safSeekCompleted = MediaHttpInstant.now()
+                // A valid byte range that the provider cannot seek is a server/storage failure,
+                // not an unsatisfiable client range; reserve 416 for actual range validation.
+                return writeTextResponse(
+                    output = output,
+                    status = 500,
+                    reason = "Internal Server Error",
+                    message = "Storage provider could not position the requested media range",
+                    acceptRanges = "bytes",
+                    contentRange = null,
+                    rangeRequest = rangeRequest,
+                    method = method,
+                    error = "SAF seek failed for media offset=$mediaOffset: ${describeThrowable(failure)}",
+                    timeline = timeline,
+                    failureKind = "SAF_SEEK_ERROR",
+                    failureStage = "SAF_SEEK",
+                )
+            }
+            timeline.safSeekCompleted = MediaHttpInstant.now()
         }
 
         val mime = UpnpXml.mediaMimeType(title, reportedMimeType)
@@ -166,6 +205,8 @@ internal object MediaHttpResponseWriter {
         val contentLength = selectedRange?.length ?: size
         val contentRange = selectedRange?.let { "bytes ${it.start}-${it.endInclusive}/$size" }
         val acceptRanges = "bytes"
+        // ClientWorker intentionally serves one request per socket; keep this explicit until the
+        // request loop and connection lifecycle are changed and validated as a unit.
         val responseConnection = "close"
         val headers = arrayListOf(
             "Content-Type: $mime",
@@ -177,39 +218,62 @@ internal object MediaHttpResponseWriter {
         )
         contentRange?.let { headers += "Content-Range: $it" }
 
-        var headersWritten = false
         val progress = TransferProgress()
+        var headersSent = false
         var complete = false
         var errorMessage: String? = null
-        var prematureEof = false
+        var failureKind: String? = null
+        var failureStage: String? = null
         try {
             writeHttpResponseHead(output, status, reason, headers)
-            headersWritten = true
-            if (method.equals("HEAD", ignoreCase = true)) {
-                output.flush()
-                complete = true
-            } else {
-                streamExact(media, output, contentLength, progress) {
-                    prematureEof = true
-                }
-                output.flush()
-                complete = progress.bytesRead == contentLength && progress.bytesWritten == contentLength
-                if (!complete) {
-                    errorMessage = "Media transfer did not write the declared Content-Length"
-                }
-            }
+            output.flush()
+            timeline.headersSent = MediaHttpInstant.now()
+            headersSent = true
         } catch (failure: Exception) {
-            errorMessage = failure.message ?: failure.javaClass.simpleName
-            // Once headers are sent, never append a second response or substitute another body.
-            // The client worker closes the connection; diagnostics mark any short write incomplete.
-            if (!headersWritten) {
-                errorMessage = "response headers failed: $errorMessage"
+            failureKind = classifyOutputFailure(failure)
+            failureStage = "RESPONSE_HEADERS"
+            errorMessage = describeThrowable(failure)
+            recordDisconnectIfPeer(failureKind, timeline)
+        }
+
+        if (headersSent) {
+            if (headOnly) {
+                try {
+                    output.flush()
+                    complete = true
+                } catch (failure: Exception) {
+                    failureKind = classifyOutputFailure(failure)
+                    failureStage = "RESPONSE_FLUSH"
+                    errorMessage = appendError(errorMessage, describeThrowable(failure))
+                    recordDisconnectIfPeer(failureKind, timeline)
+                }
             } else {
-                runCatching { output.flush() }
+                try {
+                    streamExact(media, output, contentLength, progress, timeline)
+                    output.flush()
+                    complete = progress.bytesRead == contentLength && progress.bytesWritten == contentLength
+                    if (!complete) {
+                        errorMessage = appendError(
+                            errorMessage,
+                            "Media transfer did not write the declared Content-Length",
+                        )
+                    }
+                } catch (failure: TransferFailure) {
+                    failureKind = failure.kind
+                    failureStage = failure.stage
+                    errorMessage = appendError(errorMessage, describeThrowable(failure.original))
+                    recordDisconnectIfPeer(failureKind, timeline)
+                } catch (failure: Exception) {
+                    // This covers a final flush failure after the last payload chunk.
+                    failureKind = classifyOutputFailure(failure)
+                    failureStage = "RESPONSE_FLUSH"
+                    errorMessage = appendError(errorMessage, describeThrowable(failure))
+                    recordDisconnectIfPeer(failureKind, timeline)
+                }
             }
         }
 
-        val sourceStart = safeAdd(media.startOffset, mediaOffset)
+        val sourceStart = if (progress.bytesRead > 0) safeAdd(media.startOffset, mediaOffset) else null
         return MediaHttpTransferResult(
             status = status,
             reason = reason,
@@ -223,7 +287,7 @@ internal object MediaHttpResponseWriter {
             requestedStartOffset = rangeRequest.requestedStartOffset,
             requestedEndOffset = rangeRequest.requestedEndOffset,
             requestedSuffixLength = rangeRequest.requestedSuffixLength,
-            actualMediaStartOffset = mediaOffset,
+            actualMediaStartOffset = if (progress.bytesRead > 0) mediaOffset else null,
             actualMediaEndOffsetInclusive = inclusiveEnd(mediaOffset, progress.bytesRead),
             actualSourceStartOffset = sourceStart,
             actualSourceEndOffsetInclusive = sourceStart?.let { inclusiveEnd(it, progress.bytesRead) },
@@ -231,8 +295,10 @@ internal object MediaHttpResponseWriter {
             bytesWritten = progress.bytesWritten,
             complete = complete,
             eofReached = progress.eofReached,
-            prematureEof = prematureEof,
+            prematureEof = progress.prematureEof,
             error = errorMessage,
+            failureKind = failureKind,
+            failureStage = failureStage,
         )
     }
 
@@ -241,65 +307,82 @@ internal object MediaHttpResponseWriter {
             return RangeRequest(
                 kind = if (method.equals("HEAD", ignoreCase = true)) "HEAD" else "FULL_GET",
                 selectedRange = null,
-                invalid = false,
             )
         }
-        if (!header.trim().startsWith("bytes=", ignoreCase = true) || header.contains(',')) {
-            return RangeRequest("INVALID_RANGE", null, invalid = true)
+        val normalized = header.trim()
+        if (!normalized.startsWith("bytes=", ignoreCase = true) || normalized.contains(',')) {
+            // Unknown range units and unsupported multi-range requests are ignored, not misreported
+            // as an unsatisfiable byte range. The response then carries an ordinary full length.
+            return RangeRequest("IGNORED_RANGE", null)
         }
-        val spec = header.substringAfter('=', "").trim()
+        val spec = normalized.substringAfter('=', "").trim()
         val dash = spec.indexOf('-')
-        if (dash < 0) return RangeRequest("INVALID_RANGE", null, invalid = true)
+        if (dash < 0) return RangeRequest("IGNORED_RANGE", null)
         val left = spec.substring(0, dash).trim()
         val right = spec.substring(dash + 1).trim()
         if (left.isBlank()) {
-            val suffixLength = right.toLongOrNull()?.takeIf { it > 0 }
-                ?: return RangeRequest("INVALID_RANGE", null, invalid = true)
-            if (size <= 0) {
-                return RangeRequest("SUFFIX_RANGE", null, requestedSuffixLength = suffixLength, invalid = true)
+            val suffixLength = right.toLongOrNull()?.takeIf { it >= 0 }
+                ?: return RangeRequest("IGNORED_RANGE", null)
+            if (suffixLength == 0L) {
+                return RangeRequest(
+                    kind = "SUFFIX_RANGE",
+                    selectedRange = null,
+                    requestedSuffixLength = suffixLength,
+                    unsatisfiable = true,
+                )
+            }
+            if (size < 0) {
+                return RangeRequest("SUFFIX_RANGE", null, requestedSuffixLength = suffixLength)
+            }
+            if (size == 0L) {
+                return RangeRequest("SUFFIX_RANGE", null, requestedSuffixLength = suffixLength, unsatisfiable = true)
             }
             val start = (size - suffixLength).coerceAtLeast(0L)
             return RangeRequest(
                 kind = "SUFFIX_RANGE",
                 selectedRange = ByteRange(start, size - 1),
                 requestedSuffixLength = suffixLength,
-                invalid = false,
             )
         }
 
         val start = left.toLongOrNull()?.takeIf { it >= 0 }
-            ?: return RangeRequest("INVALID_RANGE", null, invalid = true)
+            ?: return RangeRequest("IGNORED_RANGE", null)
         if (right.isBlank()) {
-            if (size <= 0 || start >= size) {
+            if (size < 0) {
+                return RangeRequest("OPEN_ENDED_RANGE", null, requestedStartOffset = start)
+            }
+            if (size == 0L || start >= size) {
                 return RangeRequest(
                     kind = "OPEN_ENDED_RANGE",
                     selectedRange = null,
                     requestedStartOffset = start,
-                    invalid = true,
+                    unsatisfiable = true,
                 )
             }
             return RangeRequest(
                 kind = "OPEN_ENDED_RANGE",
                 selectedRange = ByteRange(start, size - 1),
                 requestedStartOffset = start,
-                invalid = false,
             )
         }
 
         val end = right.toLongOrNull()?.takeIf { it >= start }
-            ?: return RangeRequest(
-                kind = "INVALID_RANGE",
-                selectedRange = null,
-                requestedStartOffset = start,
-                invalid = true,
-            )
-        if (size <= 0 || start >= size) {
+            ?: return RangeRequest("IGNORED_RANGE", null, requestedStartOffset = start)
+        if (size < 0) {
             return RangeRequest(
                 kind = "BOUNDED_RANGE",
                 selectedRange = null,
                 requestedStartOffset = start,
                 requestedEndOffset = end,
-                invalid = true,
+            )
+        }
+        if (size == 0L || start >= size) {
+            return RangeRequest(
+                kind = "BOUNDED_RANGE",
+                selectedRange = null,
+                requestedStartOffset = start,
+                requestedEndOffset = end,
+                unsatisfiable = true,
             )
         }
         return RangeRequest(
@@ -307,7 +390,6 @@ internal object MediaHttpResponseWriter {
             selectedRange = ByteRange(start, end.coerceAtMost(size - 1)),
             requestedStartOffset = start,
             requestedEndOffset = end,
-            invalid = false,
         )
     }
 
@@ -320,7 +402,10 @@ internal object MediaHttpResponseWriter {
         contentRange: String?,
         rangeRequest: RangeRequest,
         method: String,
+        timeline: MediaHttpTimeline,
         error: String? = null,
+        failureKind: String? = null,
+        failureStage: String? = null,
     ): MediaHttpTransferResult {
         val body = message.toByteArray(StandardCharsets.UTF_8)
         val contentType = "text/plain; charset=utf-8"
@@ -334,24 +419,49 @@ internal object MediaHttpResponseWriter {
         )
         acceptRanges?.let { headers += "Accept-Ranges: $it" }
         contentRange?.let { headers += "Content-Range: $it" }
+        val headOnly = method.equals("HEAD", ignoreCase = true)
         var complete = false
         var bytesWritten = 0L
+        var responseFailureKind = failureKind
+        var responseFailureStage = failureStage
         var failureMessage = error
+        var headersSent = false
         try {
             writeHttpResponseHead(output, status, reason, headers)
-            if (!method.equals("HEAD", ignoreCase = true)) {
-                output.write(body)
-                output.flush()
-                bytesWritten = contentLength
-            } else {
-                output.flush()
-            }
-            complete = true
+            output.flush()
+            timeline.headersSent = MediaHttpInstant.now()
+            headersSent = true
         } catch (failure: Exception) {
-            failureMessage = listOfNotNull(
-                failureMessage,
-                failure.message ?: failure.javaClass.simpleName,
-            ).joinToString("; ")
+            responseFailureKind = classifyOutputFailure(failure)
+            responseFailureStage = "RESPONSE_HEADERS"
+            failureMessage = appendError(failureMessage, describeThrowable(failure))
+            recordDisconnectIfPeer(responseFailureKind, timeline)
+        }
+        if (headersSent) {
+            if (headOnly) {
+                try {
+                    output.flush()
+                    complete = true
+                } catch (failure: Exception) {
+                    responseFailureKind = classifyOutputFailure(failure)
+                    responseFailureStage = "RESPONSE_FLUSH"
+                    failureMessage = appendError(failureMessage, describeThrowable(failure))
+                    recordDisconnectIfPeer(responseFailureKind, timeline)
+                }
+            } else {
+                try {
+                    output.write(body)
+                    output.flush()
+                    bytesWritten = contentLength
+                    timeline.bytesWrittenToResponse = bytesWritten
+                    complete = true
+                } catch (failure: Exception) {
+                    responseFailureKind = classifyOutputFailure(failure)
+                    responseFailureStage = "RESPONSE_WRITE"
+                    failureMessage = appendError(failureMessage, describeThrowable(failure))
+                    recordDisconnectIfPeer(responseFailureKind, timeline)
+                }
+            }
         }
         return MediaHttpTransferResult(
             status = status,
@@ -376,6 +486,8 @@ internal object MediaHttpResponseWriter {
             eofReached = false,
             prematureEof = false,
             error = failureMessage,
+            failureKind = responseFailureKind,
+            failureStage = responseFailureStage,
         )
     }
 
@@ -384,39 +496,144 @@ internal object MediaHttpResponseWriter {
         output: OutputStream,
         length: Long,
         progress: TransferProgress,
-        onPrematureEof: () -> Unit,
+        timeline: MediaHttpTimeline,
     ) {
         val buffer = ByteArray(IO_BUFFER_SIZE)
         var remaining = length
         while (remaining > 0) {
             val requested = minOf(buffer.size.toLong(), remaining).toInt()
-            val read = media.stream.read(buffer, 0, requested)
+            val read = readFromMedia(media, buffer, requested, progress)
             if (read < 0) {
                 progress.eofReached = true
-                onPrematureEof()
-                throw EOFException("Media stream ended early: expected $length bytes, read ${progress.bytesRead}, wrote ${progress.bytesWritten}")
+                progress.prematureEof = true
+                throw TransferFailure(
+                    stage = "SAF_READ",
+                    kind = "UNEXPECTED_EOF",
+                    original = EOFException(
+                        "Media stream ended early: expected $length bytes, read ${progress.bytesRead}, wrote ${progress.bytesWritten}",
+                    ),
+                )
             }
             if (read == 0) {
-                val singleByte = media.stream.read()
+                val singleByte = readOneMediaByte(media, progress)
                 if (singleByte < 0) {
                     progress.eofReached = true
-                    onPrematureEof()
-                    throw EOFException("Media stream ended early: expected $length bytes, read ${progress.bytesRead}, wrote ${progress.bytesWritten}")
+                    progress.prematureEof = true
+                    throw TransferFailure(
+                        stage = "SAF_READ",
+                        kind = "UNEXPECTED_EOF",
+                        original = EOFException(
+                            "Media stream ended early: expected $length bytes, read ${progress.bytesRead}, wrote ${progress.bytesWritten}",
+                        ),
+                    )
                 }
                 progress.bytesRead++
-                output.write(singleByte)
-                output.flush()
+                timeline.bytesReadFromSaf = progress.bytesRead
+                try {
+                    output.write(singleByte)
+                    output.flush()
+                } catch (failure: Exception) {
+                    throw TransferFailure("RESPONSE_WRITE", classifyOutputFailure(failure), failure)
+                }
                 progress.bytesWritten++
+                timeline.bytesWrittenToResponse = progress.bytesWritten
+                val now = MediaHttpInstant.now()
+                if (timeline.firstMediaByte == null) timeline.firstMediaByte = now
+                timeline.lastMediaByte = now
                 remaining--
                 continue
             }
             progress.bytesRead += read
-            output.write(buffer, 0, read)
-            output.flush()
+            timeline.bytesReadFromSaf = progress.bytesRead
+            try {
+                output.write(buffer, 0, read)
+                output.flush()
+            } catch (failure: Exception) {
+                throw TransferFailure("RESPONSE_WRITE", classifyOutputFailure(failure), failure)
+            }
             progress.bytesWritten += read
+            timeline.bytesWrittenToResponse = progress.bytesWritten
+            val now = MediaHttpInstant.now()
+            if (timeline.firstMediaByte == null) timeline.firstMediaByte = now
+            timeline.lastMediaByte = now
             remaining -= read
         }
     }
+
+    private fun readFromMedia(
+        media: MediaPayload,
+        buffer: ByteArray,
+        requested: Int,
+        progress: TransferProgress,
+    ): Int = try {
+        media.stream.read(buffer, 0, requested)
+    } catch (failure: Exception) {
+        markUnexpectedEofIfNeeded(failure, progress)
+        throw TransferFailure("SAF_READ", classifyMediaReadFailure(failure), failure)
+    }
+
+    private fun readOneMediaByte(media: MediaPayload, progress: TransferProgress): Int = try {
+        media.stream.read()
+    } catch (failure: Exception) {
+        markUnexpectedEofIfNeeded(failure, progress)
+        throw TransferFailure("SAF_READ", classifyMediaReadFailure(failure), failure)
+    }
+
+    private fun markUnexpectedEofIfNeeded(failure: Throwable, progress: TransferProgress) {
+        if (failure is EOFException) {
+            progress.eofReached = true
+            progress.prematureEof = true
+        }
+    }
+
+    private fun classifyMediaReadFailure(failure: Throwable): String =
+        if (failure is EOFException) "UNEXPECTED_EOF" else "SERVER_IO_ERROR"
+
+    private fun classifyOutputFailure(failure: Throwable): String =
+        if (isPeerDisconnect(failure)) "PEER_DISCONNECTED" else "SERVER_IO_ERROR"
+
+    private fun isPeerDisconnect(failure: Throwable): Boolean {
+        var current: Throwable? = failure
+        while (current != null) {
+            val message = current.message.orEmpty().lowercase(Locale.ROOT)
+            if (current is SocketException && listOf(
+                    "broken pipe",
+                    "connection reset",
+                    "connection aborted",
+                    "connection abort",
+                    "forcibly closed",
+                    "established connection was aborted",
+                ).any(message::contains)
+            ) return true
+            if (listOf(
+                    "broken pipe",
+                    "connection reset by peer",
+                    "connection reset",
+                    "connection aborted",
+                    "forcibly closed by the remote host",
+                    "established connection was aborted",
+                ).any(message::contains)
+            ) return true
+            current = current.cause
+        }
+        return false
+    }
+
+    private fun recordDisconnectIfPeer(kind: String?, timeline: MediaHttpTimeline) {
+        if (kind == "PEER_DISCONNECTED" && timeline.clientDisconnected == null) {
+            timeline.clientDisconnected = MediaHttpInstant.now()
+        }
+    }
+
+    private fun describeThrowable(failure: Throwable): String = generateSequence(failure) { it.cause }
+        .take(MAX_CAUSE_DEPTH)
+        .joinToString(" <- ") { cause ->
+            "${cause.javaClass.simpleName}: ${cause.message?.take(MAX_ERROR_DETAIL_CHARS) ?: "(no detail)"}"
+        }
+
+    private fun appendError(existing: String?, addition: String): String =
+        listOfNotNull(existing?.takeIf { it.isNotBlank() }, addition.takeIf { it.isNotBlank() })
+            .joinToString("; ")
 
     private fun safeAdd(left: Long, right: Long): Long? =
         if (left < 0 || right < 0 || Long.MAX_VALUE - left < right) null else left + right
@@ -430,7 +647,7 @@ internal object MediaHttpResponseWriter {
         val requestedStartOffset: Long? = null,
         val requestedEndOffset: Long? = null,
         val requestedSuffixLength: Long? = null,
-        val invalid: Boolean,
+        val unsatisfiable: Boolean = false,
     )
 
     private data class ByteRange(val start: Long, val endInclusive: Long) {
@@ -441,9 +658,18 @@ internal object MediaHttpResponseWriter {
         var bytesRead: Long = 0,
         var bytesWritten: Long = 0,
         var eofReached: Boolean = false,
+        var prematureEof: Boolean = false,
     )
 
+    private class TransferFailure(
+        val stage: String,
+        val kind: String,
+        val original: Throwable,
+    ) : IOException(original.message, original)
+
     private const val IO_BUFFER_SIZE = 128 * 1024
+    private const val MAX_ERROR_DETAIL_CHARS = 512
+    private const val MAX_CAUSE_DEPTH = 4
 }
 
 internal fun writeHttpResponseHead(output: OutputStream, status: Int, reason: String, headers: List<String>) {
