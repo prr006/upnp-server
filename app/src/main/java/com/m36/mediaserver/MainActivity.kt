@@ -253,6 +253,17 @@ class MainActivity : Activity() {
             appendLine("SSDP responses sent: ${diagnostics.ssdpResponsesSent}")
             appendLine("HTTP request count: ${diagnostics.httpRequestCount}")
             appendLine("Last HTTP request: ${diagnostics.lastHttpRequest}")
+            appendLine("Last media HTTP exchange:")
+            appendLine(diagnostics.lastMediaHttpExchange)
+            appendLine("Recent media HTTP exchanges (up to 8):")
+            if (diagnostics.mediaHttpHistory.isEmpty()) {
+                appendLine("  (none)")
+            } else {
+                diagnostics.mediaHttpHistory.forEachIndexed { index, transaction ->
+                    appendLine("--- Media request ${index + 1} ---")
+                    appendLine(transaction)
+                }
+            }
             appendLine("GET /rootDesc.xml count: ${diagnostics.rootDescriptionGetCount}")
             appendLine("Last rootDesc.xml GET: ${diagnostics.lastRootDescriptionGet}")
             appendLine("GET ContentDirectory SCPD count: ${diagnostics.contentDirectoryScpdGetCount}")

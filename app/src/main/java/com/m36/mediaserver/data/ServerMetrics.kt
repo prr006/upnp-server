@@ -13,6 +13,7 @@ class ServerMetrics {
 
     @Volatile var lastSsdpRequest: String = "—"
     @Volatile var lastHttpRequest: String = "—"
+    @Volatile var lastMediaHttpExchange: String = "—"
     @Volatile var lastRootDescriptionGet: String = "—"
     @Volatile var lastContentDirectoryScpdGet: String = "—"
     @Volatile var lastContentDirectoryControlRequest: String = "—"
@@ -40,6 +41,51 @@ class ServerMetrics {
     @Volatile var serverStatus: String = "Stopped"
 
     private val contentDirectorySoapHistory = ArrayDeque<String>()
+    private val mediaHttpHistory = ArrayDeque<String>()
+
+    @Synchronized
+    fun recordMediaHttpExchange(
+        clientAddress: String,
+        resourcePath: String,
+        resourceId: String,
+        resourceName: String?,
+        method: String,
+        rangeHeader: String?,
+        responseStatus: Int,
+        responseReason: String,
+        contentType: String?,
+        contentLength: Long?,
+        contentRange: String?,
+        acceptRanges: String?,
+        byteOffset: Long?,
+        sourceByteOffset: Long?,
+        bytesServed: Long,
+        complete: Boolean,
+        detail: String?,
+    ) {
+        val transaction = buildString {
+            appendLine("$method $resourcePath (resource ID=$resourceId)")
+            appendLine("Client address: $clientAddress")
+            appendLine("Media title: ${resourceName ?: "(unknown)"}")
+            appendLine("Range: ${rangeHeader?.takeIf { it.isNotBlank() } ?: "(none)"}")
+            appendLine("Response: $responseStatus $responseReason")
+            appendLine("Content-Type: ${contentType ?: "(not set)"}")
+            appendLine("Content-Length: ${contentLength?.toString() ?: "(not set)"}")
+            appendLine("Content-Range: ${contentRange ?: "(not set)"}")
+            appendLine("Accept-Ranges: ${acceptRanges ?: "(not set)"}")
+            appendLine("Actual media byte offset: ${byteOffset?.toString() ?: "(not reached/unknown)"}")
+            appendLine("Actual underlying source byte offset: ${sourceByteOffset?.toString() ?: "(not reached/unknown)"}")
+            appendLine("Media bytes served: $bytesServed")
+            appendLine("Transfer complete: $complete")
+            detail?.takeIf { it.isNotBlank() }?.let { appendLine("Transfer detail: $it") }
+        }.trimEnd()
+        lastMediaHttpExchange = transaction
+        if (mediaHttpHistory.size >= MAX_MEDIA_HTTP_HISTORY) mediaHttpHistory.removeFirst()
+        mediaHttpHistory.addLast(transaction)
+    }
+
+    @Synchronized
+    fun mediaHttpHistorySnapshot(): List<String> = mediaHttpHistory.toList()
 
     @Synchronized
     fun recordContentDirectorySoapTransaction(
@@ -91,5 +137,6 @@ class ServerMetrics {
     private companion object {
         const val MAX_DIAGNOSTIC_HISTORY = 8
         const val MAX_DIAGNOSTIC_BODY_CHARS = 2_048
+        const val MAX_MEDIA_HTTP_HISTORY = 8
     }
 }

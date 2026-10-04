@@ -5,7 +5,6 @@ import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.util.Base64
-import java.io.Closeable
 import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.IOException
@@ -37,14 +36,13 @@ interface MediaCatalog {
 /** A seekable SAF descriptor. Call close after streaming. */
 class OpenedMedia internal constructor(
     private val descriptor: android.content.res.AssetFileDescriptor,
-    val stream: FileInputStream,
-    val length: Long,
-    val startOffset: Long,
-) : Closeable {
+    override val stream: FileInputStream,
+    override val length: Long,
+    override val startOffset: Long,
+) : MediaPayload {
     @Throws(IOException::class)
-    fun seek(relativePosition: Long) {
-        require(relativePosition >= 0) { "Negative media offset" }
-        stream.channel.position(startOffset + relativePosition)
+    override fun seek(relativePosition: Long) {
+        seekFileInputStream(stream, startOffset, relativePosition)
     }
 
     override fun close() {

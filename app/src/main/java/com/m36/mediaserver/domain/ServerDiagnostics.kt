@@ -25,6 +25,8 @@ data class ServerDiagnostics(
     val ssdpResponsesSent: Long = 0,
     val httpRequestCount: Long = 0,
     val lastHttpRequest: String = "—",
+    val lastMediaHttpExchange: String = "—",
+    val mediaHttpHistory: List<String> = emptyList(),
     val rootDescriptionGetCount: Long = 0,
     val lastRootDescriptionGet: String = "—",
     val contentDirectoryScpdGetCount: Long = 0,

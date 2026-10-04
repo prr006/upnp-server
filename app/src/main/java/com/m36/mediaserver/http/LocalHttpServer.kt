@@ -3,7 +3,6 @@ package com.m36.mediaserver.http
 import android.content.Context
 import com.m36.mediaserver.data.ServerMetrics
 import com.m36.mediaserver.media.DocumentTreeRepository
-import com.m36.mediaserver.media.OpenedMedia
 import com.m36.mediaserver.network.NetworkSnapshot
 import com.m36.mediaserver.upnp.ConnectionManagerService
 import com.m36.mediaserver.upnp.ContentDirectoryService
@@ -24,10 +23,7 @@ import java.net.Socket
 import java.net.SocketException
 import java.net.URI
 import java.nio.charset.StandardCharsets
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
-import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
@@ -231,9 +227,21 @@ class LocalHttpServer(
             request.method == "SUBSCRIBE" && isEventPath(path) -> handleSubscribe(output, request)
             request.method == "UNSUBSCRIBE" && isEventPath(path) -> writeEmpty(output, 200, "OK")
             request.method == "GET" && path.startsWith("/media/") ->
-                handleMedia(output, request, rawPath.substringAfter("/media/"), headOnly = false)
+                handleMedia(
+                    output,
+                    request,
+                    rawPath.substringAfter("/media/"),
+                    headOnly = false,
+                    clientAddress = socket.inetAddress.hostAddress,
+                )
             request.method == "HEAD" && path.startsWith("/media/") ->
-                handleMedia(output, request, rawPath.substringAfter("/media/"), headOnly = true)
+                handleMedia(
+                    output,
+                    request,
+                    rawPath.substringAfter("/media/"),
+                    headOnly = true,
+                    clientAddress = socket.inetAddress.hostAddress,
+                )
             request.method == "OPTIONS" -> {
                 writeEmpty(output, 200, "OK", extraHeaders = listOf("Allow: GET, HEAD, POST, SUBSCRIBE, UNSUBSCRIBE, OPTIONS"))
             }
@@ -347,125 +355,100 @@ class LocalHttpServer(
         output.flush()
     }
 
-    private fun handleMedia(output: BufferedOutputStream, request: HttpRequest, token: String, headOnly: Boolean) {
-        if (token.isBlank() || token.contains('/') || token.contains("..")) {
-            writeText(output, 404, "Not Found", "Media not found", "text/plain; charset=utf-8")
-            return
-        }
-        val media = try {
-            repository.openMedia(token)
-        } catch (error: Exception) {
-            writeText(output, 404, "Not Found", "Media not found", "text/plain; charset=utf-8")
-            return
-        }
-        media.use { opened ->
-            val size = opened.length
-            val rangeHeader = request.headers["range"]
-            val selectedRange = if (rangeHeader == null) null else parseRange(rangeHeader, size)
-            if (rangeHeader != null && selectedRange == null) {
-                val contentRange = if (size >= 0) "Content-Range: bytes */$size" else null
-                writeText(
-                    output,
-                    416,
-                    "Range Not Satisfiable",
-                    "Requested byte range cannot be served",
-                    "text/plain; charset=utf-8",
-                    listOfNotNull("Accept-Ranges: bytes", contentRange),
-                )
-                return
-            }
-
-            val start = selectedRange?.start ?: 0L
-            val responseLength = when {
-                selectedRange != null -> selectedRange.length
-                size >= 0 -> size
-                else -> -1L
-            }
-            try {
-                // SAF descriptors may be pipe-backed. Normal local files are seekable; if a range
-                // was explicitly requested and seeking is unavailable, fail before sending headers.
-                if (selectedRange != null || opened.startOffset > 0) opened.seek(start)
-            } catch (_: Exception) {
-                writeText(
-                    output,
-                    416,
-                    "Range Not Satisfiable",
-                    "Selected storage provider does not support seeking this file",
-                    "text/plain; charset=utf-8",
-                    if (size >= 0) listOf("Accept-Ranges: bytes", "Content-Range: bytes */$size") else listOf("Accept-Ranges: none"),
-                )
-                return
-            }
-
-            val mediaNode = repository.metadataNodeForToken(token)
-            val mime = UpnpXml.mediaMimeType(mediaNode?.title ?: "media.bin", mediaNode?.mimeType)
-            val status = if (selectedRange == null) 200 else 206
-            val reason = if (status == 206) "Partial Content" else "OK"
-            val headers = ArrayList<String>()
-            headers += "Content-Type: $mime"
-            headers += "Accept-Ranges: bytes"
-            headers += "transferMode.dlna.org: Streaming"
-            headers += "Connection: close"
-            headers += "Server: M36MediaServer/1.0"
-            if (selectedRange != null) {
-                headers += "Content-Range: bytes ${selectedRange.start}-${selectedRange.endInclusive}/$size"
-            }
-            if (responseLength >= 0) headers += "Content-Length: $responseLength"
-            if (headOnly) {
-                writeHead(output, status, reason, headers)
-                return
-            }
-            if (responseLength < 0) headers += "Transfer-Encoding: chunked"
-            writeHead(output, status, reason, headers)
-            if (responseLength < 0) streamChunked(opened, output) else streamExact(opened, output, responseLength)
-        }
-    }
-
-    private fun streamExact(media: OpenedMedia, output: BufferedOutputStream, length: Long) {
-        val buffer = ByteArray(IO_BUFFER_SIZE)
-        var remaining = length
-        while (remaining > 0) {
-            val read = media.stream.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-            if (read < 0) break
-            if (read == 0) continue
-            output.write(buffer, 0, read)
-            remaining -= read
-        }
-        output.flush()
-    }
-
-    private fun streamChunked(media: OpenedMedia, output: BufferedOutputStream) {
-        val buffer = ByteArray(IO_BUFFER_SIZE)
-        while (true) {
-            val read = media.stream.read(buffer)
-            if (read < 0) break
-            if (read == 0) continue
-            output.write(Integer.toHexString(read).toByteArray(StandardCharsets.US_ASCII))
-            output.write("\r\n".toByteArray(StandardCharsets.US_ASCII))
-            output.write(buffer, 0, read)
-            output.write("\r\n".toByteArray(StandardCharsets.US_ASCII))
-        }
-        output.write("0\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
-        output.flush()
-    }
-
-    private fun parseRange(header: String, size: Long): ByteRange? {
-        if (size < 0 || !header.startsWith("bytes=", ignoreCase = true) || header.contains(',')) return null
-        val spec = header.substringAfter('=', "").trim()
-        val dash = spec.indexOf('-')
-        if (dash < 0 || size == 0L) return null
-        val left = spec.substring(0, dash).trim()
-        val right = spec.substring(dash + 1).trim()
-        return if (left.isBlank()) {
-            val suffixLength = right.toLongOrNull()?.takeIf { it > 0 } ?: return null
-            val start = (size - suffixLength).coerceAtLeast(0L)
-            ByteRange(start, size - 1)
+    private fun handleMedia(
+        output: BufferedOutputStream,
+        request: HttpRequest,
+        token: String,
+        headOnly: Boolean,
+        clientAddress: String,
+    ) {
+        val rangeHeader = request.headers["range"]
+        val result = if (token.isBlank() || token.contains('/') || token.contains("..")) {
+            writeMediaNotFound(output, headOnly, error = "Invalid media resource ID")
         } else {
-            val start = left.toLongOrNull()?.takeIf { it >= 0 } ?: return null
-            if (start >= size) return null
-            val requestedEnd = if (right.isBlank()) size - 1 else right.toLongOrNull()?.takeIf { it >= start } ?: return null
-            ByteRange(start, requestedEnd.coerceAtMost(size - 1))
+            val openAttempt = runCatching { repository.openMedia(token) }
+            val opened = openAttempt.getOrNull()
+            if (opened == null) {
+                val cause = openAttempt.exceptionOrNull()?.let { ": ${it.message ?: it.javaClass.simpleName}" }.orEmpty()
+                writeMediaNotFound(output, headOnly, error = "SAF media resource could not be opened$cause")
+            } else {
+                opened.use { media ->
+                    val node = repository.metadataNodeForToken(token)
+                    val transfer = MediaHttpResponseWriter.serve(
+                        output = output,
+                        method = if (headOnly) "HEAD" else request.method,
+                        rangeHeader = rangeHeader,
+                        title = node?.title ?: "media.bin",
+                        reportedMimeType = node?.mimeType,
+                        media = media,
+                    )
+                    val listedSize = node?.size?.takeIf { it >= 0 }
+                    if (listedSize != null && media.length >= 0 && listedSize != media.length) {
+                        transfer.copy(
+                            error = listOfNotNull(
+                                transfer.error,
+                                "SAF-listed size=$listedSize differs from opened media length=${media.length}",
+                            ).joinToString("; "),
+                        )
+                    } else transfer
+                }
+            }
         }
+        metrics.recordMediaHttpExchange(
+            clientAddress = clientAddress,
+            resourcePath = request.path,
+            resourceId = token,
+            resourceName = repository.metadataNodeForToken(token)?.title,
+            method = request.method,
+            rangeHeader = rangeHeader,
+            responseStatus = result.status,
+            responseReason = result.reason,
+            contentType = result.contentType,
+            contentLength = result.contentLength,
+            contentRange = result.contentRange,
+            acceptRanges = result.acceptRanges,
+            byteOffset = result.byteOffset,
+            sourceByteOffset = result.sourceByteOffset,
+            bytesServed = result.bytesServed,
+            complete = result.complete,
+            detail = result.error,
+        )
+    }
+
+    private fun writeMediaNotFound(
+        output: BufferedOutputStream,
+        headOnly: Boolean,
+        error: String,
+    ): MediaHttpTransferResult {
+        val message = "Media not found"
+        val body = message.toByteArray(StandardCharsets.UTF_8)
+        val contentType = "text/plain; charset=utf-8"
+        writeHead(
+            output,
+            404,
+            "Not Found",
+            listOf(
+                "Content-Type: $contentType",
+                "Content-Length: ${body.size}",
+                "Connection: close",
+                "Server: M36MediaServer/1.0",
+            ),
+        )
+        if (!headOnly) output.write(body)
+        output.flush()
+        return MediaHttpTransferResult(
+            status = 404,
+            reason = "Not Found",
+            contentType = contentType,
+            contentLength = body.size.toLong(),
+            contentRange = null,
+            acceptRanges = null,
+            byteOffset = null,
+            sourceByteOffset = null,
+            bytesServed = 0,
+            complete = true,
+            error = error,
+        )
     }
 
     private fun baseUrlFor(socket: Socket): String {
@@ -581,16 +564,8 @@ class LocalHttpServer(
         output.flush()
     }
 
-    private fun writeHead(output: BufferedOutputStream, status: Int, reason: String, headers: List<String>) {
-        output.write("HTTP/1.1 $status $reason\r\n".toByteArray(StandardCharsets.US_ASCII))
-        output.write("Date: ${httpDate()}\r\n".toByteArray(StandardCharsets.US_ASCII))
-        headers.forEach { header -> output.write("$header\r\n".toByteArray(StandardCharsets.ISO_8859_1)) }
-        output.write("\r\n".toByteArray(StandardCharsets.US_ASCII))
-    }
-
-    private fun httpDate(): String = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US)
-        .apply { timeZone = TimeZone.getTimeZone("GMT") }
-        .format(Date())
+    private fun writeHead(output: BufferedOutputStream, status: Int, reason: String, headers: List<String>) =
+        writeHttpResponseHead(output, status, reason, headers)
 
     private data class HttpRequest(
         val method: String,
@@ -600,10 +575,6 @@ class LocalHttpServer(
         val rawHeaders: Map<String, String>,
         val body: ByteArray,
     )
-
-    private data class ByteRange(val start: Long, val endInclusive: Long) {
-        val length: Long get() = endInclusive - start + 1
-    }
 
     private class RequestTooLargeException : IOException("Request exceeded configured size limit")
 
