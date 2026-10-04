@@ -7,8 +7,8 @@ import com.m36.mediaserver.media.OpenedMedia
 import com.m36.mediaserver.network.NetworkSnapshot
 import com.m36.mediaserver.upnp.ConnectionManagerService
 import com.m36.mediaserver.upnp.ContentDirectoryService
+import com.m36.mediaserver.upnp.SoapServiceVersion
 import com.m36.mediaserver.upnp.SoapXml
-import com.m36.mediaserver.upnp.UpnpFault
 import com.m36.mediaserver.upnp.UpnpXml
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -251,70 +251,57 @@ class LocalHttpServer(
         val rawSoapAction = request.rawHeaders["soapaction"] ?: request.headers["soapaction"]
         val contentType = request.rawHeaders["content-type"] ?: request.headers["content-type"]
         val soapBody = request.body.toString(StandardCharsets.UTF_8)
-        var actionName: String? = null
-        var actionNamespace: String? = null
-        var recognition = "SOAP body not parsed"
-        var responseStatus = 500
-        var responseReason = "Internal Server Error"
-        var upnpErrorCode: Int? = null
-        var responseBody = ""
-        var responseHeaders = emptyList<String>()
-
-        try {
-            // Content-Type is diagnostic only: a valid SOAP body is not gated on one exact media type.
-            val parsed = SoapXml.parseAction(soapBody)
-            actionName = parsed.actionName
-            actionNamespace = parsed.actionNamespace
-            val headerActionName = SoapXml.actionNameFromSoapAction(rawSoapAction)
+        val expectedService = if (isContentDirectory) {
+            SoapServiceVersion.CONTENT_DIRECTORY_1
+        } else {
+            SoapServiceVersion.CONNECTION_MANAGER_1
+        }
+        // Content-Type is diagnostic only, and SOAPAction is a hint only. The body namespace and
+        // local action name determine dispatch; quoted/unquoted header formatting cannot reject it.
+        val result = SoapXml.dispatch(soapBody, expectedService) { parsed ->
             if (isContentDirectory) {
-                val classification = recognizeContentDirectoryAction(parsed.actionName)
-                val headerNote = when {
-                    rawSoapAction.isNullOrBlank() -> "SOAPAction missing; dispatching from SOAP body"
-                    headerActionName == null -> "SOAPAction unparsed; dispatching from SOAP body"
-                    headerActionName.equals(parsed.actionName, ignoreCase = true) -> "SOAPAction matches SOAP body"
-                    else -> "SOAPAction/body mismatch (header action=$headerActionName); dispatching from SOAP body"
-                }
-                recognition = "$classification; $headerNote"
-            }
-            val serviceType = if (isContentDirectory) {
-                UpnpXml.CONTENT_DIRECTORY_TYPE
-            } else {
-                UpnpXml.CONNECTION_MANAGER_TYPE
-            }
-            val outputs = if (isContentDirectory) {
                 contentDirectory.handle(parsed.actionName, parsed.arguments, baseUrl)
             } else {
                 connectionManager.handle(parsed.actionName, parsed.arguments)
             }
-            responseBody = SoapXml.response(parsed.actionName, serviceType, outputs)
-            responseStatus = 200
-            responseReason = "OK"
-        } catch (fault: UpnpFault) {
-            upnpErrorCode = fault.errorCode
-            if (isContentDirectory) {
-                recognition = actionName?.let {
-                    "${recognizeContentDirectoryAction(it)} rejected: UPnP ${fault.errorCode} ${fault.message}"
-                } ?: "SOAP parse rejected: UPnP ${fault.errorCode} ${fault.message}"
+        }
+        val parsedRequest = result.request
+        val actionName = parsedRequest?.actionName
+        val actionNamespace = parsedRequest?.actionNamespace
+        val upnpErrorCode = result.upnpFault?.errorCode
+        val responseHeaders = if (result.upnpFault == null) emptyList() else listOf("EXT:")
+        val recognition = if (!isContentDirectory) {
+            "—"
+        } else {
+            val actionClassification = actionName?.let(::recognizeContentDirectoryAction) ?: "SOAP body not parsed"
+            val serviceDescription = when (parsedRequest?.serviceVersion) {
+                SoapServiceVersion.CONTENT_DIRECTORY_1 -> "ContentDirectory:1"
+                SoapServiceVersion.CONNECTION_MANAGER_1 -> "ConnectionManager:1"
+                SoapServiceVersion.UNKNOWN -> "unknown namespace ${parsedRequest?.actionNamespace ?: "—"}"
+                null -> "unknown service"
             }
-            responseBody = SoapXml.fault(fault)
-            responseHeaders = listOf("EXT:")
-        } catch (error: Exception) {
-            val fault = UpnpFault(501, "Action Failed")
-            upnpErrorCode = fault.errorCode
-            if (isContentDirectory) {
-                recognition = "${actionName?.let(::recognizeContentDirectoryAction) ?: "SOAP parse error"} rejected: ${error.message ?: error.javaClass.simpleName}"
+            val baseRecognition = "$actionClassification ($serviceDescription)"
+            if (result.upnpFault != null) {
+                "$baseRecognition rejected: UPnP ${result.upnpFault.errorCode} ${result.upnpFault.message}"
+            } else {
+                val headerActionName = SoapXml.actionNameFromSoapAction(rawSoapAction)
+                val headerNote = when {
+                    rawSoapAction.isNullOrBlank() -> "SOAPAction missing; dispatched from SOAP body"
+                    headerActionName == null -> "SOAPAction unparsed; dispatched from SOAP body"
+                    headerActionName.equals(actionName, ignoreCase = true) -> "SOAPAction matches SOAP body"
+                    else -> "SOAPAction/body mismatch (header action=$headerActionName); body action dispatched"
+                }
+                "$baseRecognition; $headerNote"
             }
-            responseBody = SoapXml.fault(fault)
-            responseHeaders = listOf("EXT:")
         }
 
         var responseWritten = false
         try {
             writeText(
                 output,
-                responseStatus,
-                responseReason,
-                responseBody,
+                result.httpStatus,
+                result.reasonPhrase,
+                result.responseXml,
                 "text/xml; charset=\"utf-8\"",
                 responseHeaders,
             )
@@ -323,8 +310,9 @@ class LocalHttpServer(
             if (isContentDirectory) {
                 val requestDescription = "POST ${request.path} from $clientAddress"
                 val status = buildString {
-                    append(responseStatus).append(' ').append(responseReason)
+                    append(result.httpStatus).append(' ').append(result.reasonPhrase)
                     upnpErrorCode?.let { append(" (UPnP fault ").append(it).append(')') }
+                    result.processingError?.let { append(" (processing error: ").append(it).append(')') }
                     if (!responseWritten) append(" (response write failed)")
                 }
                 metrics.recordContentDirectorySoapTransaction(

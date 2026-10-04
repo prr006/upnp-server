@@ -12,23 +12,24 @@ class SoapXmlTest {
     fun parsesSoap11UsingArbitraryPrefixesAndAllBrowseArguments() {
         val request = SoapXml.parseAction(
             """<?xml version="1.0" encoding="utf-8"?>
-                <SOAP-ENV:Envelope xmlns:SOAP-ENV="$SOAP_NS">
-                  <SOAP-ENV:Header />
-                  <SOAP-ENV:Body>
-                    <u:Browse xmlns:u="$CONTENT_DIRECTORY_NS">
+                <envAlias:Envelope xmlns:envAlias="$SOAP_NS">
+                  <envAlias:Header />
+                  <envAlias:Body>
+                    <actionAlias:Browse xmlns:actionAlias="$CONTENT_DIRECTORY_NS">
                       <ObjectID> 0 </ObjectID>
                       <BrowseFlag>BrowseDirectChildren</BrowseFlag>
                       <Filter>*</Filter>
                       <StartingIndex>0</StartingIndex>
                       <RequestedCount>9</RequestedCount>
                       <SortCriteria>+dc:title</SortCriteria>
-                    </u:Browse>
-                  </SOAP-ENV:Body>
-                </SOAP-ENV:Envelope>""".trimIndent(),
+                    </actionAlias:Browse>
+                  </envAlias:Body>
+                </envAlias:Envelope>""".trimIndent(),
         )
 
         assertEquals("Browse", request.actionName)
         assertEquals(CONTENT_DIRECTORY_NS, request.actionNamespace)
+        assertEquals(SoapServiceVersion.CONTENT_DIRECTORY_1, request.serviceVersion)
         assertEquals(SOAP_NS, request.envelopeNamespace)
         assertEquals(
             mapOf(
@@ -55,6 +56,7 @@ class SoapXmlTest {
 
         assertEquals("GetSystemUpdateID", request.actionName)
         assertEquals(CONTENT_DIRECTORY_NS, request.actionNamespace)
+        assertEquals(SoapServiceVersion.CONTENT_DIRECTORY_1, request.serviceVersion)
         assertTrue(request.arguments.isEmpty())
     }
 

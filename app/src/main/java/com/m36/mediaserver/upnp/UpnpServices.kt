@@ -10,11 +10,27 @@ import org.xml.sax.InputSource
 
 class UpnpFault(val errorCode: Int, override val message: String) : Exception(message)
 
+enum class SoapServiceVersion(val namespaceUri: String) {
+    CONTENT_DIRECTORY_1("urn:schemas-upnp-org:service:ContentDirectory:1"),
+    CONNECTION_MANAGER_1("urn:schemas-upnp-org:service:ConnectionManager:1"),
+    UNKNOWN(""),
+}
+
 data class SoapActionRequest(
     val actionName: String,
     val arguments: Map<String, String>,
     val actionNamespace: String,
     val envelopeNamespace: String,
+    val serviceVersion: SoapServiceVersion,
+)
+
+data class SoapDispatchResult(
+    val request: SoapActionRequest?,
+    val httpStatus: Int,
+    val reasonPhrase: String,
+    val responseXml: String,
+    val upnpFault: UpnpFault? = null,
+    val processingError: String? = null,
 )
 
 object SoapXml {
@@ -29,7 +45,8 @@ object SoapXml {
             if (normalizedXml.isBlank()) throw UpnpFault(402, "Invalid Args: empty SOAP body")
             val factory = DocumentBuilderFactory.newInstance().apply {
                 isNamespaceAware = true
-                isXIncludeAware = false
+                // Android's built-in DOM parser throws UnsupportedOperationException from
+                // setXIncludeAware(), even when setting false. XInclude is disabled by default.
                 setExpandEntityReferences(false)
                 setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
                 setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
@@ -49,6 +66,7 @@ object SoapXml {
                 ?: throw UpnpFault(401, "SOAP action missing")
             val actionName = localName(action).trim()
             if (actionName.isEmpty()) throw UpnpFault(401, "SOAP action name missing")
+            val actionNamespace = action.namespaceURI.orEmpty()
             val arguments = LinkedHashMap<String, String>()
             for (element in childElements(action)) {
                 val name = localName(element).trim()
@@ -57,14 +75,62 @@ object SoapXml {
             return SoapActionRequest(
                 actionName = actionName,
                 arguments = arguments,
-                actionNamespace = action.namespaceURI.orEmpty(),
+                actionNamespace = actionNamespace,
                 envelopeNamespace = envelope.namespaceURI.orEmpty(),
+                serviceVersion = serviceVersionForNamespace(actionNamespace),
             )
         } catch (fault: UpnpFault) {
             throw fault
         } catch (error: Exception) {
             throw UpnpFault(402, "Invalid Args: ${error.message ?: "malformed SOAP XML"}")
         }
+    }
+
+    /** Dispatch from the SOAP body namespace and local action name; SOAPAction is not required. */
+    fun dispatch(
+        xml: String,
+        expectedService: SoapServiceVersion,
+        actionHandler: (SoapActionRequest) -> List<Pair<String, String>>,
+    ): SoapDispatchResult {
+        var request: SoapActionRequest? = null
+        return try {
+            val parsedRequest = parseAction(xml)
+            request = parsedRequest
+            if (parsedRequest.serviceVersion != expectedService) {
+                throw UpnpFault(401, "Invalid Action namespace for ${expectedService.name}")
+            }
+            val outputs = actionHandler(parsedRequest)
+            SoapDispatchResult(
+                request = parsedRequest,
+                httpStatus = 200,
+                reasonPhrase = "OK",
+                responseXml = response(parsedRequest.actionName, expectedService.namespaceUri, outputs),
+            )
+        } catch (fault: UpnpFault) {
+            SoapDispatchResult(
+                request = request,
+                httpStatus = 500,
+                reasonPhrase = "Internal Server Error",
+                responseXml = SoapXml.fault(fault),
+                upnpFault = fault,
+            )
+        } catch (error: Exception) {
+            val fault = UpnpFault(501, "Action Failed")
+            SoapDispatchResult(
+                request = request,
+                httpStatus = 500,
+                reasonPhrase = "Internal Server Error",
+                responseXml = SoapXml.fault(fault),
+                upnpFault = fault,
+                processingError = error.message ?: error.javaClass.simpleName,
+            )
+        }
+    }
+
+    fun serviceVersionForNamespace(namespaceUri: String): SoapServiceVersion = when (namespaceUri) {
+        CONTENT_DIRECTORY_NS -> SoapServiceVersion.CONTENT_DIRECTORY_1
+        CONNECTION_MANAGER_NS -> SoapServiceVersion.CONNECTION_MANAGER_1
+        else -> SoapServiceVersion.UNKNOWN
     }
 
     /** SOAPAction is a hint; parse quoted or unquoted values for diagnostics/consistency checks. */
@@ -144,7 +210,10 @@ class ContentDirectoryService(
                     throw UpnpFault(720, "Cannot read object metadata: ${error.message ?: "storage provider error"}")
                 }
                 "BrowseDirectChildren" -> try {
-                    repository.children(objectId)
+                    // UPnP ObjectID=0 represents the user-selected shared directory itself;
+                    // enumerate its children rather than exposing an extra synthetic folder row.
+                    val catalogParentId = if (objectId == "0") SELECTED_SHARED_ROOT_ID else objectId
+                    repository.children(catalogParentId)
                 } catch (_: java.io.FileNotFoundException) {
                     throw UpnpFault(701, "No Such Object")
                 } catch (error: Exception) {
@@ -229,6 +298,7 @@ class ContentDirectoryService(
     }
 
     private companion object {
+        const val SELECTED_SHARED_ROOT_ID = "shared-root"
         const val UINT32_MAX = 0xFFFF_FFFFL
     }
 }

@@ -4,29 +4,99 @@ import com.m36.mediaserver.media.MediaCatalog
 import com.m36.mediaserver.media.MediaNode
 import java.io.StringReader
 import javax.xml.parsers.DocumentBuilderFactory
-import org.xml.sax.InputSource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.w3c.dom.Element
+import org.xml.sax.InputSource
 
 class ContentDirectoryServiceTest {
     @Test
-    fun rootBrowseReturnsTheSelectedSharedRootContainer() {
+    fun exactVlcBrowseSoapDispatchesContentDirectory1AndReturnsSelectedFolderChildren() {
+        val soapAction = "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\""
+        val requestBody = """<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+<ObjectID>0</ObjectID>
+<BrowseFlag>BrowseDirectChildren</BrowseFlag>
+<Filter>*</Filter>
+<StartingIndex>0</StartingIndex>
+<RequestedCount>5000</RequestedCount>
+<SortCriteria></SortCriteria>
+</u:Browse>
+</s:Body>
+</s:Envelope>"""
         val service = ContentDirectoryService(TestCatalog())
-        val outputs = service.handle(
-            "Browse",
-            browseArgs("0", "BrowseDirectChildren"),
-            "http://10.221.18.195:8200",
-        ).toMap()
+        var dispatchedAction: String? = null
+        val result = SoapXml.dispatch(
+            requestBody,
+            SoapServiceVersion.CONTENT_DIRECTORY_1,
+        ) { request ->
+            dispatchedAction = request.actionName
+            service.handle(request.actionName, request.arguments, "http://10.221.18.195:8200")
+        }
 
-        assertEquals("1", outputs["NumberReturned"])
-        assertEquals("1", outputs["TotalMatches"])
-        assertEquals("17", outputs["UpdateID"])
-        assertTrue(outputs.getValue("Result").contains("<container id=\"shared-root\" parentID=\"0\""))
-        assertTrue(outputs.getValue("Result").contains("childCount=\"1\""))
-        assertTrue(outputs.getValue("Result").contains("<dc:title>Jellyfin</dc:title>"))
+        assertEquals("Browse", SoapXml.actionNameFromSoapAction(soapAction))
+        assertEquals("Browse", dispatchedAction)
+        assertEquals(SoapServiceVersion.CONTENT_DIRECTORY_1, result.request?.serviceVersion)
+        assertEquals("urn:schemas-upnp-org:service:ContentDirectory:1", result.request?.actionNamespace)
+        assertEquals(
+            mapOf(
+                "ObjectID" to "0",
+                "BrowseFlag" to "BrowseDirectChildren",
+                "Filter" to "*",
+                "StartingIndex" to "0",
+                "RequestedCount" to "5000",
+                "SortCriteria" to "",
+            ),
+            result.request?.arguments,
+        )
+        assertEquals(200, result.httpStatus)
+        assertEquals("OK", result.reasonPhrase)
+        assertNull(result.upnpFault)
+        assertFalse(result.responseXml.contains("<errorCode>402</errorCode>"))
+        assertTrue(result.responseXml.contains("<u:BrowseResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">"))
+
+        val soapDocument = parseDocument(result.responseXml)
+        val browseResponse = soapDocument.getElementsByTagNameNS(
+            "urn:schemas-upnp-org:service:ContentDirectory:1",
+            "BrowseResponse",
+        ).item(0)
+        assertNotNull(browseResponse)
+        val didlXml = soapDocument.getElementsByTagName("Result").item(0).textContent
+        val didl = parseDocument(didlXml).documentElement
+        assertEquals("DIDL-Lite", didl.localName)
+        assertEquals("urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/", didl.namespaceURI)
+        val containers = didl.getElementsByTagNameNS(didl.namespaceURI, "container")
+        assertEquals(1, containers.length)
+        val sakamoto = containers.item(0) as Element
+        assertEquals("d:sakamoto", sakamoto.getAttribute("id"))
+        assertEquals("shared-root", sakamoto.getAttribute("parentID"))
+        assertEquals(
+            "Sakamoto Days",
+            sakamoto.getElementsByTagNameNS("http://purl.org/dc/elements/1.1/", "title").item(0).textContent,
+        )
+        assertEquals("1", soapDocument.getElementsByTagName("NumberReturned").item(0).textContent)
+        assertEquals("1", soapDocument.getElementsByTagName("TotalMatches").item(0).textContent)
+        assertEquals("17", soapDocument.getElementsByTagName("UpdateID").item(0).textContent)
+
+        val nestedFolders = service.handle(
+            "Browse",
+            browseArgs("d:sakamoto", "BrowseDirectChildren"),
+            "http://10.221.18.195:8200",
+        ).toMap().getValue("Result")
+        assertTrue(nestedFolders.contains("<container id=\"d:season1\" parentID=\"d:sakamoto\""))
+        val nestedFiles = service.handle(
+            "Browse",
+            browseArgs("d:season1", "BrowseDirectChildren"),
+            "http://10.221.18.195:8200",
+        ).toMap().getValue("Result")
+        assertWellFormedXml(nestedFiles)
+        assertTrue(nestedFiles.contains("<item id=\"i:e01\" parentID=\"d:season1\""))
     }
 
     @Test
@@ -34,8 +104,9 @@ class ContentDirectoryServiceTest {
         val service = ContentDirectoryService(TestCatalog())
         val baseUrl = "http://10.221.18.195:8200"
 
-        val jellyfin = browse(service, "0", baseUrl)
-        assertTrue(jellyfin.contains("id=\"shared-root\""))
+        val selectedRootChildren = browse(service, "0", baseUrl)
+        assertTrue(selectedRootChildren.contains("id=\"d:sakamoto\" parentID=\"shared-root\""))
+        assertTrue(selectedRootChildren.contains("<dc:title>Sakamoto Days</dc:title>"))
 
         val show = browse(service, "shared-root", baseUrl)
         assertTrue(show.contains("<container id=\"d:sakamoto\" parentID=\"shared-root\""))
@@ -159,10 +230,12 @@ class ContentDirectoryServiceTest {
         "SortCriteria" to "+dc:title",
     )
 
+    private fun parseDocument(xml: String) = DocumentBuilderFactory.newInstance().apply {
+        isNamespaceAware = true
+    }.newDocumentBuilder().parse(InputSource(StringReader(xml)))
+
     private fun assertWellFormedXml(xml: String) {
-        val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
-        val root = factory.newDocumentBuilder().parse(InputSource(StringReader(xml))).documentElement
-        assertEquals("DIDL-Lite", root.localName)
+        assertEquals("DIDL-Lite", parseDocument(xml).documentElement.localName)
     }
 
     private class TestCatalog : MediaCatalog {
